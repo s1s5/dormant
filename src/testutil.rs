@@ -32,6 +32,8 @@ pub struct MockContainer {
     pub start_fails: bool,
     /// Docker healthcheck の状態(None = healthcheckなし)
     pub health: Option<String>,
+    /// 接続ネットワーク一覧 (ネットワーク名, IP)。空なら従来どおり単一ネットワーク
+    pub networks: Vec<(String, String)>,
 }
 
 impl MockContainer {
@@ -43,6 +45,7 @@ impl MockContainer {
             port,
             start_fails: false,
             health: None,
+            networks: Vec::new(),
         }
     }
 }
@@ -295,9 +298,21 @@ async fn handle(
             ),
             None => format!("{{\"Running\":{}}}", running),
         };
+        // 複数ネットワーク指定があればそれを返す(共有ネットワーク優先のテスト用)
+        let networks_json = if c.networks.is_empty() {
+            format!("{{\"dormant\":{{\"IPAddress\":\"{}\"}}}}", ip)
+        } else {
+            let entries = c
+                .networks
+                .iter()
+                .map(|(name, nip)| format!("\"{}\":{{\"IPAddress\":\"{}\"}}", name, nip))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{}}}", entries)
+        };
         return json_response(&format!(
-            "{{\"State\":{},\"NetworkSettings\":{{\"Networks\":{{\"dormant\":{{\"IPAddress\":\"{}\"}}}}}}}}",
-            state_json, ip
+            "{{\"State\":{},\"NetworkSettings\":{{\"Networks\":{}}}}}",
+            state_json, networks_json
         ));
     }
 

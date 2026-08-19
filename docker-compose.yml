@@ -10,7 +10,7 @@ services:
       HOME: "${HOME}"
       CARGO_HOME: "${HOME}/.cargo"
       RUSTUP_HOME: "/home/dev/.rustup"
-      RUST_LOG: debug,h2=info,hyper=info,tower=info
+      RUST_LOG: debug,h2=info,hyper=info,tower=info,bollard=error
     working_dir: ${PWD}
     volumes:
       - ${PWD}:${PWD}
@@ -22,10 +22,14 @@ services:
     stop_grace_period: 1s
     networks:
       - dormant
+      - global
     ports:
       - "${PORT:-18000}:18000"
 
 networks:
   dormant:
     name: dormant
+    external: true
+  global:
+    name: global
     external: true

@@ -8,8 +8,10 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 use crate::config::*;
 use crate::router::Router;
@@ -64,16 +66,59 @@ pub struct ManagedContainer {
 #[derive(Clone)]
 pub struct DockerClient {
     docker: Docker,
+    /// dormant 自身が接続しているネットワーク名(共有ネットワークのIP優先に使う)
+    self_networks: Arc<RwLock<Option<HashSet<String>>>>,
 }
 
 impl DockerClient {
     pub fn new(socket_path: &str) -> Result<Self> {
         let docker = Docker::connect_with_unix(socket_path, 120, bollard::API_DEFAULT_VERSION)?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            self_networks: Arc::new(RwLock::new(None)),
+        })
     }
 
     pub fn inner(&self) -> &Docker {
         &self.docker
+    }
+
+    /// dormant 自身が接続しているネットワーク名を取得(初回のみ解決してキャッシュ)
+    pub async fn self_networks(&self) -> HashSet<String> {
+        if let Some(nets) = self.self_networks.read().await.as_ref() {
+            return nets.clone();
+        }
+        let nets = self.resolve_self_networks().await;
+        *self.self_networks.write().await = Some(nets.clone());
+        nets
+    }
+
+    /// 自身のコンテナIDから接続ネットワーク名を解決
+    async fn resolve_self_networks(&self) -> HashSet<String> {
+        let Ok(hostname) = std::fs::read_to_string("/etc/hostname") else {
+            return HashSet::new();
+        };
+        let hostname = hostname.trim().to_string();
+        let Ok(inspect) = self
+            .docker
+            .inspect_container(&hostname, None::<InspectContainerOptions>)
+            .await
+        else {
+            return HashSet::new();
+        };
+        inspect
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .unwrap_or_default()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// テスト用: dormant 自身のネットワーク名を直接設定する
+    #[cfg(test)]
+    pub async fn set_self_networks(&self, nets: HashSet<String>) {
+        *self.self_networks.write().await = Some(nets);
     }
 
     /// 管理対象コンテナの一覧を取得
@@ -98,6 +143,7 @@ impl DockerClient {
     }
 
     /// コンテナのIPアドレスを取得
+    /// dormant 自身と共有するネットワークのIPを優先し、なければ最初のネットワークのIPを使う
     pub async fn resolve_ip(&self, id: &str) -> Result<String> {
         let inspect = self
             .docker
@@ -107,7 +153,20 @@ impl DockerClient {
             .network_settings
             .and_then(|ns| ns.networks)
             .unwrap_or_default();
-        // 最初のネットワークのIPを使う
+
+        // dormant 自身と共有するネットワークのIPを優先
+        let self_nets = self.self_networks().await;
+        if !self_nets.is_empty() {
+            if let Some(ip) = networks
+                .iter()
+                .filter(|(name, _)| self_nets.contains(*name))
+                .find_map(|(_, n)| n.ip_address.clone().filter(|ip| !ip.is_empty()))
+            {
+                return Ok(ip);
+            }
+        }
+
+        // 共有ネットワークが無い/解決できない場合は最初のネットワークのIPを使う
         let ip = networks
             .values()
             .find_map(|n| n.ip_address.clone().filter(|ip| !ip.is_empty()))
@@ -514,5 +573,48 @@ mod tests {
             compose_service: Some("app2".to_string()),
         };
         assert!(missing.resolve_dependencies(&[dep]).is_empty());
+    }
+
+    // 共有ネットワークのIPを優先する(複数ネットワーク接続時)
+    #[tokio::test]
+    async fn test_resolve_ip_prefers_shared_network() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        // 対象コンテナは global(共有) と trace(非共有) の2ネットワークに接続
+        let mut target = MockContainer::new("app", "172.22.0.3", 8000);
+        target.networks = vec![
+            ("trace".to_string(), "172.21.0.2".to_string()),
+            ("global".to_string(), "172.22.0.3".to_string()),
+        ];
+        let (docker, _mock) = setup_mock_docker(vec![target]).await;
+
+        // dormant 自身は global にのみ接続
+        docker
+            .set_self_networks(HashSet::from(["global".to_string()]))
+            .await;
+
+        // 共有ネットワーク(global)のIPが選ばれる
+        let ip = docker.resolve_ip("app").await.unwrap();
+        assert_eq!(ip, "172.22.0.3");
+    }
+
+    // 共有ネットワークが無い場合は最初のネットワークのIPにフォールバック
+    #[tokio::test]
+    async fn test_resolve_ip_falls_back_when_no_shared_network() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let mut target = MockContainer::new("app", "172.22.0.3", 8000);
+        target.networks = vec![
+            ("trace".to_string(), "172.21.0.2".to_string()),
+            ("global".to_string(), "172.22.0.3".to_string()),
+        ];
+        let (docker, _mock) = setup_mock_docker(vec![target]).await;
+
+        // dormant 自身はどのネットワークにも接続していない(空)
+        docker.set_self_networks(HashSet::new()).await;
+
+        // フォールバックで最初のネットワークのIPが返る
+        let ip = docker.resolve_ip("app").await.unwrap();
+        assert_eq!(ip, "172.21.0.2");
     }
 }

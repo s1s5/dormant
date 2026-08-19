@@ -6,8 +6,17 @@ services:
       dormant.port: "80"
       dormant.host: "pa-test"
       dormant.session-duration: "2m"
+      # dormant.healthcheck.path: "/"
+      # dormant.healthcheck.port: "80"
+      # dormant.healthcheck.status: "200"
     networks:
       - dormant
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
 networks:
   dormant:
