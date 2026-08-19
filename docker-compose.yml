@@ -17,14 +17,14 @@ services:
       - ${HOME}/.cargo/.global-cache:${HOME}/.cargo/.global-cache
       - ${HOME}/.cargo/registry:${HOME}/.cargo/registry
       - ${HOME}/.cargo/git:${HOME}/.cargo/git
-      - /run/user/1000/docker.sock:/var/run/docker.sock
-      - ./dormant.docker.yml:/etc/dormant/dormant.yml
+      - /run/user/1000/docker.sock:/run/user/1000/docker.sock
+      - ./dormant.yml:/etc/dormant/dormant.yml
     stop_grace_period: 1s
     networks:
       - dormant
       - global
     ports:
-      - "${PORT:-18000}:18000"
+      - "${PORT:-18000}:80"
 
 networks:
   dormant:

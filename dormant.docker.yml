@@ -1,4 +1,0 @@
-# dormant をコンテナ内で動かすときの設定
-listen: "0.0.0.0:18000"
-docker_socket: "/var/run/docker.sock"
-idle_check_interval_secs: 10
