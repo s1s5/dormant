@@ -120,7 +120,7 @@ mod tests {
         ManagedContainer {
             id: format!("id-{name}"),
             name: name.to_string(),
-            port: 8000,
+            port: Some(8000),
             group: group.map(|s| s.to_string()),
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),

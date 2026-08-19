@@ -23,9 +23,9 @@ services:
     networks:
       - dormant
     ports:
-      - "${PORT}:18000"
+      - "${PORT:-18000}:18000"
 
 networks:
   dormant:
-    name: ${NETWORK}
+    name: dormant
     external: true

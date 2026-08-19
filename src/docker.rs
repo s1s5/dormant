@@ -30,8 +30,8 @@ pub struct ManagedContainer {
     pub id: String,
     /// コンテナ名(/ 付き)
     pub name: String,
-    /// 公開ポート
-    pub port: u16,
+    /// 公開ポート(依存専用コンテナなど未指定の場合は None)
+    pub port: Option<u16>,
     /// 所属グループ
     pub group: Option<String>,
     /// セッション保持時間
@@ -217,6 +217,8 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         .get(LABEL_HEALTHCHECK_PORT)
         .and_then(|v| v.parse::<u16>().ok());
 
+    // ポート: dormant.port > dormant.healthcheck.port > 公開ポートの先頭
+    // 未指定でも管理対象として扱う(依存専用コンテナなど)。転送時のみ必要
     let port = labels
         .get("dormant.port")
         .and_then(|v| v.parse::<u16>().ok())
@@ -225,7 +227,7 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
             c.ports.as_ref().and_then(|ports| {
                 ports.iter().filter_map(|p| Some(p.private_port)).next()
             })
-        })?;
+        });
 
     let session_duration = parse_duration(
         labels.get(LABEL_SESSION_DURATION).map(|s| s.as_str()),
@@ -300,11 +302,13 @@ impl ManagedContainer {
 
     /// 転送先アドレスを計算(コンテナIP直アクセス)
     /// ip が解決できない場合はコンテナIDにフォールバック
+    /// ポート未指定(依存専用コンテナ)は IP のみ返す
     pub fn target_addr(&self) -> String {
-        if let Some(ip) = &self.ip {
-            format!("{}:{}", ip, self.port)
-        } else {
-            format!("{}:{}", self.id, self.port)
+        match (&self.ip, self.port) {
+            (Some(ip), Some(port)) => format!("{}:{}", ip, port),
+            (Some(ip), None) => ip.clone(),
+            (None, Some(port)) => format!("{}:{}", self.id, port),
+            (None, None) => self.id.clone(),
         }
     }
 
@@ -404,7 +408,7 @@ mod tests {
         let dep = ManagedContainer {
             id: "id-dep".to_string(),
             name: "/dep-1".to_string(),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -422,7 +426,7 @@ mod tests {
         let app = ManagedContainer {
             id: "id-app".to_string(),
             name: "app-1".to_string(),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -450,7 +454,7 @@ mod tests {
         let other = ManagedContainer {
             id: "id-other".to_string(),
             name: "other-1".to_string(),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -468,7 +472,7 @@ mod tests {
         let cache = ManagedContainer {
             id: "id-cache".to_string(),
             name: "cache-1".to_string(),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -491,7 +495,7 @@ mod tests {
         let missing = ManagedContainer {
             id: "id-missing".to_string(),
             name: "missing-1".to_string(),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),

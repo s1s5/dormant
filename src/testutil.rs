@@ -324,7 +324,7 @@ pub fn make_container(id: &str, group: Option<&str>) -> ManagedContainer {
     ManagedContainer {
         id: id.to_string(),
         name: format!("/{}-1", id),
-        port: 8000,
+        port: Some(8000),
         group: group.map(|s| s.to_string()),
         session_duration: Duration::from_secs(3600),
         startup_timeout: Duration::from_secs(5),

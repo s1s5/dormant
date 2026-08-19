@@ -1,0 +1,34 @@
+services:
+  web:
+    image: nginx:alpine
+    labels:
+      dormant.enable: "true"
+      dormant.port: "80"
+      dormant.host: "pb-test"
+      dormant.session-duration: "2m"
+    networks:
+      - dormant
+    depends_on:
+      - backend
+    volumes:
+      - html-data:/usr/share/nginx/html:ro
+
+  backend:
+    image: debian:bookworm
+    volumes:
+      - html-data:/var/www/html
+    command: >
+      sh -c "while true; do
+        echo \"<!DOCTYPE html><html><head><meta http-equiv='refresh' content='1'></head><body><h1>$(date)</h1></body></html>\" > /var/www/html/index.html;
+        sleep 1;
+      done"
+    labels:
+      dormant.enable: "true"
+    stop_grace_period: 1s
+
+networks:
+  dormant:
+    name: dormant
+
+volumes:
+  html-data:

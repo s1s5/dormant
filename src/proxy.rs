@@ -537,7 +537,7 @@ mod tests {
         let (ip, port) = addr.rsplit_once(':').unwrap();
         let port: u16 = port.parse().unwrap();
         let mut c = testutil::make_container(id, group);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
         c.hosts = vec![format!("{}.localhost", id)];
@@ -656,7 +656,7 @@ mod tests {
         let mut mc = MockContainer::new("sse", ip, port);
         mc.running = true; // 起動済みにしておく
         let mut c = testutil::make_container("sse", None);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
         c.hosts = vec!["sse.localhost".to_string()];
@@ -730,7 +730,7 @@ mod tests {
         let mut mc = MockContainer::new("grpc", ip, port);
         mc.running = true;
         let mut c = testutil::make_container("grpc", None);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
         c.hosts = vec!["grpc.localhost".to_string()];
@@ -765,7 +765,7 @@ mod tests {
         let mut mc = MockContainer::new("grpc", ip, port);
         mc.running = true;
         let mut c = testutil::make_container("grpc", None);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
         c.hosts = vec!["grpc.localhost".to_string()];

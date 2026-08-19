@@ -1,0 +1,14 @@
+services:
+  web:
+    image: nginx:alpine
+    labels:
+      dormant.enable: "true"
+      dormant.port: "80"
+      dormant.host: "pa-test"
+      dormant.session-duration: "2m"
+    networks:
+      - dormant
+
+networks:
+  dormant:
+    name: dormant

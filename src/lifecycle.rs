@@ -278,7 +278,7 @@ async fn ensure_started_single(
     // すでに起動済みならOK(IPは起動後に取り直す)
     if docker.is_running(&container.id).await? {
         if let Ok(ip) = docker.resolve_ip(&container.id).await {
-            return Ok(format!("{}:{}", ip, container.port));
+            return Ok(addr_with_port(&ip, container.port));
         }
         return Ok(container.target_addr());
     }
@@ -304,7 +304,12 @@ async fn ensure_started_single(
         // 2. 起動後にIPを再解決し、ポート疎通を確認
         // 停止中コンテナはIPが空のため、起動後に取り直す
         if let Ok(ip) = docker.resolve_ip(&container.id).await {
-            let addr = format!("{}:{}", ip, container.port);
+            // ポート未指定(依存専用コンテナ)は running になった時点で ready
+            let Some(port) = container.port else {
+                tracing::info!("container {} is ready at {}", container.name, ip);
+                return Ok(ip);
+            };
+            let addr = format!("{}:{}", ip, port);
             if port_is_open(&addr).await {
                 let ready = match &container.healthcheck_status {
                     // status 指定あり → ヘルスチェックパスへGETし許容ステータスを確認
@@ -372,6 +377,14 @@ pub async fn ensure_group_started(
             group,
             timeout
         )),
+    }
+}
+
+/// IP とポートから転送先アドレスを組み立てる(ポート未指定は IP のみ)
+fn addr_with_port(ip: &str, port: Option<u16>) -> String {
+    match port {
+        Some(p) => format!("{}:{}", ip, p),
+        None => ip.to_string(),
     }
 }
 
@@ -541,7 +554,7 @@ mod tests {
         ManagedContainer {
             id: id.to_string(),
             name: format!("/{}-{}", project, service),
-            port: 8000,
+            port: Some(8000),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -684,7 +697,7 @@ mod tests {
         startup_timeout: Duration,
     ) -> ManagedContainer {
         let mut c = crate::testutil::make_container(id, group);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = startup_timeout;
         c
     }
@@ -698,7 +711,7 @@ mod tests {
         port: u16,
     ) -> ManagedContainer {
         let mut c = crate::testutil::make_compose_container(id, project, service, depends_on);
-        c.port = port;
+        c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c
     }
@@ -824,6 +837,34 @@ mod tests {
         let addr = ensure_started(&docker, &app, &[db.clone(), app.clone()]).await.unwrap();
         // 依存 db が起動・ready になってから本体の addr が返る
         assert!(mock.is_running("db"));
+        assert!(addr.contains(&ip));
+    }
+
+    // D1-1b: 依存先がポート未指定(依存専用コンテナ)でも管理対象として起動される
+    #[tokio::test]
+    async fn test_depends_on_D1_1b_dep_without_port_started() {
+        let (ip, pa) = backend().await;
+        let (docker, mock) = mock(vec![
+            MockContainer::new("backend", &ip, 0),
+            MockContainer::new("web", &ip, pa),
+        ])
+        .await;
+        // backend はポート未指定(依存専用)の管理対象コンテナ
+        let mut backend = crate::testutil::make_compose_container(
+            "backend",
+            "pb",
+            "backend",
+            vec![],
+        );
+        backend.port = None;
+        backend.startup_timeout = Duration::from_secs(3);
+        let web = compose("web", "pb", "web", vec![dep("backend", "service_started")], pa);
+        let addr = ensure_started(&docker, &web, &[backend.clone(), web.clone()])
+            .await
+            .unwrap();
+        // ポート未指定の依存 backend も起動される
+        assert!(mock.is_running("backend"));
+        assert!(mock.is_running("web"));
         assert!(addr.contains(&ip));
     }
 
