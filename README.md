@@ -1,0 +1,140 @@
+# dormant
+
+Docker **scale-to-zero リバースプロキシ**。`dormant.enable=true` ラベルが付いたコンテナを、リクエストが来たときにオンデマンドで起動し、アイドル状態が続くと自動で停止します。コンテナの台数を減らしてリソースを節約したいときに使います。
+
+## 特徴
+
+- **オンデマンド起動**：Host ヘッダーや `dormant.host` ラベルでルーティングし、未起動のコンテナを自動起動してからリクエストを転送。
+- **アイドル停止**：最終アクセスからセッション保持時間（`dormant.session-duration`、既定 1h）を超えると自動停止。
+- **グループ連鎖**：`dormant.group` で複数コンテナをまとめ、依存（`compose.depends_on`）を連鎖的に起動・停止。
+- **ヘルスチェック**：`dormant.healthcheck.*` で起動待ちを確認してから転送開始。
+- **WebSocket / SSE 対応**：アクティブ接続中のコンテナは停止対象外。
+- **HTTP/1.1 ・ HTTP/2 対応**、`/healthz` で自ヘルスチェック。
+- **graceful shutdown**：SIGINT / SIGTERM で停止。
+
+## 前提
+
+- Docker ソケット（Unix ソケット）にアクセス可能な環境
+- ラベルを付与した管理対象コンテナ
+- ルーティングにはコンテナ名（末尾 `-数字` は剥がす）または `dormant.host` ラベルを使います
+
+## インストール
+
+```bash
+cargo build --release
+# バイナリは target/release/dormant
+```
+
+## 設定（dormant.yml）
+
+```yaml
+# 待ち受けアドレス
+listen: "0.0.0.0:80"
+# Docker ソケット
+docker_socket: "/var/run/docker.sock"
+# アイドルチェック間隔（秒）
+idle_check_interval_secs: 30
+```
+
+| 項目 | 既定値 | 説明 |
+|------|--------|------|
+| `listen` | `0.0.0.0:80` | HTTP 待ち受け |
+| `docker_socket` | `/var/run/docker.sock` | Docker ソケットのパス |
+| `idle_check_interval_secs` | `30` | アイドル判定の周期（秒） |
+
+設定ファイルのパスは `-c` / `--config` で指定します（既定 `dormant.yml`）。ファイルが無ければ既定値を使います。
+
+## 使い方
+
+```bash
+# 起動
+dormant -c dormant.yml
+
+# 環境変数 RUST_LOG でログレベル変更（例: debug）
+RUST_LOG=debug dormant -c dormant.yml
+```
+
+### コンテナへのラベル付け
+
+管理対象にするには `dormant.enable=true` を付けます。ルーティングはコンテナ名（末尾の `-数字` を剥がしたもの）か `dormant.host` で行います。
+
+```bash
+docker run -d --name myapp \
+  --label dormant.enable=true \
+  --label dormant.port=80 \
+  myapp-image
+```
+
+利用可能なラベル：
+
+| ラベル | 説明 |
+|--------|------|
+| `dormant.enable` | `true` で管理対象にする |
+| `dormant.port` | 転送先ポート（未指定なら公開ポート / 依存専用コンテナは IP のみ） |
+| `dormant.host` | ルーティング用ホスト名（カンマ区切りで複数） |
+| `dormant.group` | グループ名。同一グループを連動起動・停止 |
+| `dormant.session-duration` | セッション保持時間（例 `30m`, `2h`。既定 `1h`） |
+| `dormant.startup.timeout` | 起動タイムアウト（既定 `3m`） |
+| `dormant.healthcheck.path` | 起動待ちヘルスチェックのパス |
+| `dormant.healthcheck.port` | ヘルスチェックのポート |
+| `dormant.healthcheck.status` | 許容ステータス（カンマ区切り複数可） |
+
+### 依存関係（compose）
+
+`compose.depends_on` を使うと、`docker compose` の依存先コンテナを管理対象として一緒に起動します。依存先のポート未指定コンテナは、起動して IP だけ返します。
+
+## 開発
+
+### ビルド・テスト
+
+```bash
+cargo build
+cargo test
+```
+
+### E2E テスト
+
+```bash
+# 前提: dormant が localhost:18000 で起動中（docker-compose の dormant コンテナ）
+docker compose up -d
+./e2e-test.sh
+```
+
+- テスト用コンテナは `dormant-e2e-*` という名前で作成され、終了時に必ず削除されます。
+- `DORMANT_CONTAINER` 環境変数で dormant 本体のコンテナ名を上書きできます。
+- 詳細は `tests/pa` / `tests/pb` の `docker-compose.yml` と `e2e-wsclient.py` / `e2e-wskeep.py`（WebSocket 検証）を参照。
+
+## アーキテクチャ
+
+```text
+クライアント
+   │  HTTP/1.1・HTTP/2（Host: xxx）
+   ▼
+[ proxy ] ──転送──▶ [ 管理対象コンテナ ]
+   │  ▲ touch / connect / disconnect（セッション記録）
+   │  │
+   ▼  │
+[ router ]  Host→コンテナのルーティング表
+   │
+   ▼
+[ lifecycle ]  idle_loop: 期限切れコンテナを停止（連鎖）
+   │
+   ▼
+[ docker ]  ラベル収集・起動・停止・イベント監視
+```
+
+- `src/main.rs` … 起動、設定読み込み、タスクの起動・ graceful shutdown
+- `src/config.rs` … 設定の解析と Docker ラベル定数
+- `src/docker.rs` … ラベル収集、コンテナ起動/停止、イベント監視、IP 解決
+- `src/router.rs` … Host → コンテナのルーティング表
+- `src/lifecycle.rs` … セッション管理とアイドル停止
+- `src/proxy.rs` … HTTP リバースプロキシ、WebSocket ブリッジ
+
+## 既知の制限 / TODO
+
+- 一つのコンテナに 2 つ以上のポートがある場合の対応
+- TCP（非 HTTP）プロトコルのサポート
+
+## ライセンス
+
+このリポジトリは現時点でライセンスを明示していません。利用前に管理者へ確認してください。
