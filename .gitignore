@@ -1,0 +1,5 @@
+/target
+/thoughts
+
+.env
+__pycache__

@@ -1,0 +1,24 @@
+[package]
+name = "dormant"
+version = "0.1.0"
+edition = "2021"
+description = "Docker scale-to-zero reverse proxy: start containers on demand, stop when idle"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-tungstenite = "0.30"
+tokio-tungstenite = "0.30"
+tungstenite = "0.30"
+bollard = "0.21"
+futures-util = "0.3"
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+humantime = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

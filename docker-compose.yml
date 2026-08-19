@@ -1,0 +1,31 @@
+services:
+  dormant:
+    image: s1s5/rust-dev:1.97.1-26.04
+    command:
+      - cargo
+      - watch
+      - -s
+      - 'cargo run -- -c /etc/dormant/dormant.yml'
+    environment:
+      HOME: "${HOME}"
+      CARGO_HOME: "${HOME}/.cargo"
+      RUSTUP_HOME: "/home/dev/.rustup"
+      RUST_LOG: debug,h2=info,hyper=info,tower=info
+    working_dir: ${PWD}
+    volumes:
+      - ${PWD}:${PWD}
+      - ${HOME}/.cargo/.global-cache:${HOME}/.cargo/.global-cache
+      - ${HOME}/.cargo/registry:${HOME}/.cargo/registry
+      - ${HOME}/.cargo/git:${HOME}/.cargo/git
+      - /run/user/1000/docker.sock:/var/run/docker.sock
+      - ./dormant.docker.yml:/etc/dormant/dormant.yml
+    stop_grace_period: 1s
+    networks:
+      - dormant
+    ports:
+      - "${PORT}:18000"
+
+networks:
+  dormant:
+    name: ${NETWORK}
+    external: true
