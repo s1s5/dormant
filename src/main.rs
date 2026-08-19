@@ -16,6 +16,8 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
 /// コマンドライン引数
@@ -74,9 +76,51 @@ async fn main() -> Result<()> {
     });
 
     // HTTPサーバー起動
-    proxy::serve(&config, docker.clone(), router.clone(), sessions).await?;
+    let config_server = config.clone();
+    let server_task = tokio::spawn(async move {
+        proxy::serve(
+            &config_server,
+            docker.clone(),
+            router.clone(),
+            sessions.clone(),
+        )
+        .await
+    });
 
+    // Ctrl+C / SIGTERM を待って graceful shutdown
+    let shutdown = wait_for_shutdown_signal();
+
+    tokio::select! {
+        result = server_task => {
+            result??;
+        }
+        _ = shutdown => {
+            tracing::info!("shutdown signal received, stopping tasks");
+        }
+    }
+
+    // バックグラウンドタスクを停止
+    event_task.abort();
+    idle_task.abort();
     let _ = event_task.await;
     let _ = idle_task.await;
+    tracing::info!("dormant stopped");
     Ok(())
+}
+
+/// Ctrl+C または SIGTERM を待つ
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let sigterm_fut = async {
+        sigterm.recv().await;
+    };
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("received SIGINT (Ctrl+C)");
+        }
+        _ = sigterm_fut => {
+            tracing::info!("received SIGTERM");
+        }
+    }
 }
