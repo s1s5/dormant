@@ -8,6 +8,7 @@ mod docker;
 mod lifecycle;
 mod proxy;
 mod router;
+mod tcp;
 
 #[cfg(test)]
 mod testutil;
@@ -17,7 +18,6 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 
 /// コマンドライン引数
@@ -77,14 +77,26 @@ async fn main() -> Result<()> {
 
     // HTTPサーバー起動
     let config_server = config.clone();
+    let docker_server = docker.clone();
+    let router_server = router.clone();
+    let sessions_server = sessions.clone();
     let server_task = tokio::spawn(async move {
         proxy::serve(
             &config_server,
-            docker.clone(),
-            router.clone(),
-            sessions.clone(),
+            docker_server,
+            router_server,
+            sessions_server,
         )
         .await
+    });
+
+    // TCP転送サーバー起動 (dormant.tcp ラベルのポートを待ち受け)
+    let config_tcp = config.clone();
+    let docker_tcp = docker.clone();
+    let router_tcp = router.clone();
+    let sessions_tcp = sessions.clone();
+    let tcp_task = tokio::spawn(async move {
+        tcp::serve_tcp(&config_tcp, router_tcp, docker_tcp, sessions_tcp).await
     });
 
     // Ctrl+C / SIGTERM を待って graceful shutdown
@@ -92,6 +104,9 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = server_task => {
+            result??;
+        }
+        result = tcp_task => {
             result??;
         }
         _ = shutdown => {

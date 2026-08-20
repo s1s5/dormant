@@ -12,6 +12,10 @@ use crate::docker::ManagedContainer;
 #[derive(Clone, Default)]
 pub struct Router {
     inner: Arc<RwLock<HashMap<String, Vec<ManagedContainer>>>>,
+    /// TCP転送用のルーティング表
+    /// key: dormant 側の待ち受けポート
+    /// value: そのポートの管理対象コンテナ候補リスト
+    tcp_listen: Arc<RwLock<HashMap<u16, Vec<ManagedContainer>>>>,
 }
 
 impl Router {
@@ -22,6 +26,7 @@ impl Router {
     /// ルーターを再構築
     pub async fn update(&self, containers: Vec<ManagedContainer>) {
         let mut map = HashMap::new();
+        let mut tcp_map = HashMap::new();
         for c in containers {
             // コンテナ名からHost名を導出
             // 例: /federation-router-federation-router.sizebook-1 → federation-router-federation-router.sizebook
@@ -45,13 +50,27 @@ impl Router {
             for host in &c.hosts {
                 Self::add(&mut map, host.clone(), &c);
             }
+
+            // TCP転送: dormant.tcp で公開するポートを登録
+            if let Some(expose) = &c.tcp_expose {
+                Self::add_tcp(&mut tcp_map, expose.listen_port, &c);
+            }
         }
         *self.inner.write().await = map;
+        *self.tcp_listen.write().await = tcp_map;
     }
 
     /// 候補リストに追加(同一コンテナIDは重複追加しない)
     fn add(map: &mut HashMap<String, Vec<ManagedContainer>>, host: String, c: &ManagedContainer) {
         let v = map.entry(host).or_default();
+        if !v.iter().any(|x| x.id == c.id) {
+            v.push(c.clone());
+        }
+    }
+
+    /// TCPルーティング表への追加(同一コンテナIDは重複追加しない)
+    fn add_tcp(map: &mut HashMap<u16, Vec<ManagedContainer>>, port: u16, c: &ManagedContainer) {
+        let v = map.entry(port).or_default();
         if !v.iter().any(|x| x.id == c.id) {
             v.push(c.clone());
         }
@@ -76,6 +95,17 @@ impl Router {
         map.iter()
             .find(|(k, _)| host.ends_with(k.as_str()) && host.len() > k.len())
             .and_then(|(_, v)| Self::pick(v))
+    }
+
+    /// TCP待ち受けポートからコンテナを解決
+    pub async fn resolve_tcp(&self, listen_port: u16) -> Option<ManagedContainer> {
+        let map = self.tcp_listen.read().await;
+        map.get(&listen_port).and_then(|v| Self::pick(v))
+    }
+
+    /// 登録されているTCP待ち受けポート一覧
+    pub async fn tcp_listen_ports(&self) -> Vec<u16> {
+        self.tcp_listen.read().await.keys().copied().collect()
     }
 
     /// 管理対象コンテナの一覧(コンテナIDでユニーク)
@@ -121,6 +151,7 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: group.map(|s| s.to_string()),
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -415,5 +446,88 @@ mod tests {
         // group_containers() はグループ起動用に維持
         let group = router.group_containers("federation-router-sizebook").await;
         assert_eq!(group.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tcp_port() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 9000,
+        });
+        router.update(vec![c]).await;
+
+        let c = router.resolve_tcp(6334).await.unwrap();
+        assert_eq!(c.id, "id-/app-1");
+        assert!(router.resolve_tcp(9999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_listen_ports() {
+        let router = Router::new();
+        let mut a = make_container("/a-1", None);
+        a.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 6334,
+        });
+        let mut b = make_container("/b-1", None);
+        b.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 7000,
+            container_port: 8000,
+        });
+        router.update(vec![a, b]).await;
+
+        let mut ports = router.tcp_listen_ports().await;
+        ports.sort_unstable();
+        assert_eq!(ports, vec![6334, 7000]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tcp_conflict_running_wins() {
+        let router = Router::new();
+        let mut stopped = make_container("/old-1", None);
+        let mut running = make_container("/new-1", None);
+        stopped.running = false;
+        running.running = true;
+        stopped.created = Some(3000);
+        running.created = Some(1000);
+        stopped.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 6334,
+        });
+        running.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 6334,
+        });
+        router.update(vec![stopped, running]).await;
+
+        let c = router.resolve_tcp(6334).await.unwrap();
+        assert!(c.is_running());
+        assert_eq!(c.id, "id-/new-1");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tcp_all_stopped_newest_wins() {
+        let router = Router::new();
+        let mut old = make_container("/old-1", None);
+        let mut new = make_container("/new-1", None);
+        old.running = false;
+        new.running = false;
+        old.created = Some(1000);
+        new.created = Some(2000);
+        old.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 6334,
+        });
+        new.tcp_expose = Some(crate::docker::TcpExpose {
+            listen_port: 6334,
+            container_port: 6334,
+        });
+        router.update(vec![old, new]).await;
+
+        let c = router.resolve_tcp(6334).await.unwrap();
+        assert!(!c.is_running());
+        assert_eq!(c.id, "id-/new-1");
     }
 }

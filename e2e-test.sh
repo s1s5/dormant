@@ -824,6 +824,104 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# K. TCP 転送 (E34-E36)
+# ---------------------------------------------------------------------------
+
+# TCP エコーサーバーコンテナを起動 (dormant 管理対象)
+# dormant.tcp=LISTEN_PORT:CONTAINER_PORT で TCP 転送を公開する
+# コンテナ内では python でエコーサーバーを立てる (busybox nc は -e 非対応のため)
+run_tcp_container() { # name listen_port container_port
+    local name=$1 listen=$2 cport=$3
+    local code
+    code=$(mktemp /tmp/dormant-tcp.XXXXXX.py)
+    cat > "$code" <<'PYEOF'
+import socket, sys
+PORT = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", PORT))
+srv.listen(5)
+while True:
+    conn, _ = srv.accept()
+    def handle():
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            conn.sendall(data)
+        conn.close()
+    import threading
+    threading.Thread(target=handle, daemon=True).start()
+PYEOF
+    docker run -d --name "$name" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port="$cport" \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label "dormant.tcp=$listen:$cport" \
+        -v "$code":/tcp_srv.py:ro \
+        python:3.12-alpine python3 /tcp_srv.py "$cport" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$code"
+    return $rc
+}
+
+# E34: dormant.tcp で公開したポートへ TCP 接続 → エコーバックで往復確認
+test_e34() {
+    run_tcp_container "$PREFIX-tcp1" 18101 18101 || return 1
+    # dormant の TCP リスナーが立ち上がるのを待つ (ルート同期 + ポーリング)
+    local deadline=$((SECONDS + 15))
+    while (( SECONDS < deadline )); do
+        local out
+        out=$(echo "hello-e34" | timeout 5 nc -w 3 localhost 18101) || true
+        if [ "$out" = "hello-e34" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# E35: dormant.tcp=LISTEN_PORT:CONTAINER_PORT の別ポート指定で転送
+test_e35() {
+    run_tcp_container "$PREFIX-tcp2" 18102 18102 || return 1
+    local deadline=$((SECONDS + 15))
+    while (( SECONDS < deadline )); do
+        local out
+        out=$(echo "hello-e35" | timeout 5 nc -w 3 localhost 18102) || true
+        if [ "$out" = "hello-e35" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# E36: TCP 接続中は session-duration (10s) を超えても停止しない
+test_e36() {
+    run_tcp_container "$PREFIX-tcp3" 18103 18103 || return 1
+    local deadline=$((SECONDS + 15))
+    while (( SECONDS < deadline )); do
+        if echo "hello" | timeout 5 nc -w 3 localhost 18103 >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    # バックグラウンドで TCP 接続を保持 (20秒)
+    ( echo "keep"; sleep 20 ) | timeout 22 nc localhost 18103 >/dev/null 2>&1 &
+    local cpid=$!
+    sleep 12  # session-duration=10s を超えるまで待つ (接続中は停止しないはず)
+    if ! container_running "$PREFIX-tcp3"; then
+        kill "$cpid" 2>/dev/null
+        return 1  # 接続中なのに停止した → 失敗
+    fi
+    kill "$cpid" 2>/dev/null
+    wait "$cpid" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 main() {
@@ -873,6 +971,9 @@ main() {
     run_test "E31 WS 接続中は停止しない" test_e31
     run_test "E32 HTTP/2 (h2c) でアクセス (200)" test_e32
     run_test "E33 gRPC バックエンドへの転送 (Health/Check)" test_e33
+    run_test "E34 TCP 転送 (エコーバック)" test_e34
+    run_test "E35 TCP 転送 (dormant.tcp 別ポート)" test_e35
+    run_test "E36 TCP 接続中は停止しない" test_e36
 
     # サマリ
     echo

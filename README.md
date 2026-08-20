@@ -5,6 +5,7 @@ Docker **scale-to-zero リバースプロキシ**。`dormant.enable=true` ラベ
 ## 特徴
 
 - **オンデマンド起動**：Host ヘッダーや `dormant.host` ラベルでルーティングし、未起動のコンテナを自動起動してからリクエストを転送。
+- **TCP 転送**：`dormant.tcp` ラベルで公開したポートへ dormant が待ち受け、接続をコンテナへ透過転送。
 - **アイドル停止**：最終アクセスからセッション保持時間（`dormant.session-duration`、既定 1h）を超えると自動停止。
 - **グループ連鎖**：`dormant.group` で複数コンテナをまとめ、依存（`compose.depends_on`）を連鎖的に起動・停止。
 - **ヘルスチェック**：`dormant.healthcheck.*` で起動待ちを確認してから転送開始。
@@ -72,12 +73,35 @@ docker run -d --name myapp \
 | `dormant.enable` | `true` で管理対象にする |
 | `dormant.port` | 転送先ポート（未指定なら公開ポート / 依存専用コンテナは IP のみ） |
 | `dormant.host` | ルーティング用ホスト名（カンマ区切りで複数） |
+| `dormant.tcp` | TCP転送。`PORT`（listen=コンテナ=同一）または `LISTEN_PORT:CONTAINER_PORT` |
 | `dormant.group` | グループ名。同一グループを連動起動・停止 |
 | `dormant.session-duration` | セッション保持時間（例 `30m`, `2h`。既定 `1h`） |
 | `dormant.startup.timeout` | 起動タイムアウト（既定 `3m`） |
 | `dormant.healthcheck.path` | 起動待ちヘルスチェックのパス |
 | `dormant.healthcheck.port` | ヘルスチェックのポート |
 | `dormant.healthcheck.status` | 許容ステータス（カンマ区切り複数可） |
+
+### TCP 転送
+
+`dormant.tcp` ラベルで TCP ポートを公開すると、dormant がそのポートで待ち受け、接続を当該コンテナへ透過転送します。HTTP と同様に、未起動なら自動起動してから接続し、接続中はアイドル停止しません。
+
+```bash
+# 同じポート番号で待ち受け (listen とコンテナ側が同一)
+docker run -d --name mytcp \
+  --label dormant.enable=true \
+  --label dormant.tcp=6379 \
+  mytcp-image
+
+# 待ち受けポートとコンテナ側ポートを別に指定
+docker run -d --name mytcp \
+  --label dormant.enable=true \
+  --label dormant.tcp=18102:6379 \
+  mytcp-image
+```
+
+- `dormant.tcp=PORT` … dormant は `PORT` で待ち受け、コンテナの `PORT` へ転送。
+- `dormant.tcp=LISTEN_PORT:CONTAINER_PORT` … dormant は `LISTEN_PORT` で待ち受け、コンテナの `CONTAINER_PORT` へ転送。
+- コンテナ側の疎通確認には `dormant.port`（または `dormant.tcp` のコンテナ側ポート）を使います。
 
 ### 依存関係（compose）
 
@@ -107,14 +131,14 @@ docker compose up -d
 ## アーキテクチャ
 
 ```text
-クライアント
-   │  HTTP/1.1・HTTP/2（Host: xxx）
-   ▼
-[ proxy ] ──転送──▶ [ 管理対象コンテナ ]
-   │  ▲ touch / connect / disconnect（セッション記録）
-   │  │
-   ▼  │
-[ router ]  Host→コンテナのルーティング表
+HTTP クライアント              TCP クライアント
+   │  HTTP/1.1・HTTP/2（Host: xxx）   │  TCP（dormant.tcp ポート）
+   ▼                                ▼
+[ proxy ] ──HTTP転送──▶       [ tcp ] ──TCP透過転送──▶
+   │  ▲ touch / connect / disconnect（セッション記録）   │
+   │  │                                                    │
+   ▼  │                                                    ▼
+[ router ]  Host→コンテナ と TCPポート→コンテナ のルーティング表
    │
    ▼
 [ lifecycle ]  idle_loop: 期限切れコンテナを停止（連鎖）
@@ -126,6 +150,7 @@ docker compose up -d
 - `src/main.rs` … 起動、設定読み込み、タスクの起動・ graceful shutdown
 - `src/config.rs` … 設定の解析と Docker ラベル定数
 - `src/docker.rs` … ラベル収集、コンテナ起動/停止、イベント監視、IP 解決
+- `src/tcp.rs` … `dormant.tcp` による TCP 透過転送（起動待ち・セッション連携込み）
 - `src/router.rs` … Host → コンテナのルーティング表
 - `src/lifecycle.rs` … セッション管理とアイドル停止
 - `src/proxy.rs` … HTTP リバースプロキシ、WebSocket ブリッジ
@@ -133,7 +158,6 @@ docker compose up -d
 ## 既知の制限 / TODO
 
 - 一つのコンテナに 2 つ以上のポートがある場合の対応
-- TCP（非 HTTP）プロトコルのサポート
 
 ## ライセンス
 

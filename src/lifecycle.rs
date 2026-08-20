@@ -555,6 +555,7 @@ mod tests {
             id: id.to_string(),
             name: format!("/{}-{}", project, service),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),

@@ -16,6 +16,8 @@ pub const LABEL_HEALTHCHECK_PATH: &str = "dormant.healthcheck.path";
 pub const LABEL_HEALTHCHECK_PORT: &str = "dormant.healthcheck.port";
 pub const LABEL_HEALTHCHECK_STATUS: &str = "dormant.healthcheck.status";
 pub const LABEL_HOST: &str = "dormant.host";
+/// TCP転送ラベル。形式: `PORT` または `LISTEN_PORT:CONTAINER_PORT`
+pub const LABEL_TCP: &str = "dormant.tcp";
 
 /// compose が付与するラベル
 pub const LABEL_COMPOSE_DEPENDS_ON: &str = "com.docker.compose.depends_on";

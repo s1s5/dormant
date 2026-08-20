@@ -25,6 +25,15 @@ pub struct Dependency {
     pub condition: String,
 }
 
+/// TCP転送の公開設定
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpExpose {
+    /// dormant 側の待ち受けポート
+    pub listen_port: u16,
+    /// コンテナ側の転送先ポート
+    pub container_port: u16,
+}
+
 /// dormant 管理対象コンテナの情報
 #[derive(Debug, Clone)]
 pub struct ManagedContainer {
@@ -34,6 +43,8 @@ pub struct ManagedContainer {
     pub name: String,
     /// 公開ポート(依存専用コンテナなど未指定の場合は None)
     pub port: Option<u16>,
+    /// TCP転送の公開設定(dormant.tcp ラベルで指定)
+    pub tcp_expose: Option<TcpExpose>,
     /// 所属グループ
     pub group: Option<String>,
     /// セッション保持時間
@@ -333,10 +344,16 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         })
         .unwrap_or_default();
 
+    // dormant.tcp ラベル: `PORT` または `LISTEN_PORT:CONTAINER_PORT`
+    let tcp_expose = labels
+        .get(LABEL_TCP)
+        .and_then(|v| parse_tcp_expose(v));
+
     Some(ManagedContainer {
         id,
         name,
         port,
+        tcp_expose,
         group: labels.get(LABEL_GROUP).cloned(),
         session_duration,
         startup_timeout,
@@ -392,6 +409,41 @@ fn parse_duration(v: Option<&str>, default: &str) -> Duration {
         .unwrap_or_else(|| humantime::parse_duration(default).unwrap())
 }
 
+/// dormant.tcp ラベルをパースする
+/// 形式: `PORT` → listen もコンテナも同じポート
+///       `LISTEN_PORT:CONTAINER_PORT` → 別ポートを指定
+fn parse_tcp_expose(v: &str) -> Option<TcpExpose> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match v.split_once(':') {
+        // LISTEN_PORT:CONTAINER_PORT 形式
+        Some((l, c)) => {
+            let listen_port = l.trim().parse::<u16>().ok()?;
+            let container_port = c.trim().parse::<u16>().ok()?;
+            if listen_port == 0 || container_port == 0 {
+                return None;
+            }
+            Some(TcpExpose {
+                listen_port,
+                container_port,
+            })
+        }
+        // PORT 形式 (listen = コンテナ = 同一ポート)
+        None => {
+            let port = v.parse::<u16>().ok()?;
+            if port == 0 {
+                return None;
+            }
+            Some(TcpExpose {
+                listen_port: port,
+                container_port: port,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +463,61 @@ mod tests {
         assert_eq!(
             parse_duration(Some("abc"), DEFAULT_SESSION_DURATION),
             Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn test_parse_tcp_expose() {
+        // 単一ポート (listen = コンテナ = 同一)
+        assert_eq!(
+            parse_tcp_expose("6334"),
+            Some(TcpExpose {
+                listen_port: 6334,
+                container_port: 6334,
+            })
+        );
+        // 別ポート指定
+        assert_eq!(
+            parse_tcp_expose("6334:8000"),
+            Some(TcpExpose {
+                listen_port: 6334,
+                container_port: 8000,
+            })
+        );
+        // 空白許容
+        assert_eq!(
+            parse_tcp_expose(" 6334 : 9000 "),
+            Some(TcpExpose {
+                listen_port: 6334,
+                container_port: 9000,
+            })
+        );
+        // 不正な値は None
+        assert_eq!(parse_tcp_expose("abc"), None);
+        assert_eq!(parse_tcp_expose(""), None);
+        assert_eq!(parse_tcp_expose("0"), None);
+        assert_eq!(parse_tcp_expose("6334:0"), None);
+        assert_eq!(parse_tcp_expose("99999"), None);
+    }
+
+    #[test]
+    fn test_parse_container_tcp_expose() {
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+        labels.insert(LABEL_TCP.to_string(), "6334:9000".to_string());
+        let c = ContainerSummary {
+            id: Some("abc123".to_string()),
+            names: Some(vec!["/test-1".to_string()]),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let m = parse_container(&c).unwrap();
+        assert_eq!(
+            m.tcp_expose,
+            Some(TcpExpose {
+                listen_port: 6334,
+                container_port: 9000,
+            })
         );
     }
 
@@ -468,6 +575,7 @@ mod tests {
             id: "id-dep".to_string(),
             name: "/dep-1".to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -486,6 +594,7 @@ mod tests {
             id: "id-app".to_string(),
             name: "app-1".to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -514,6 +623,7 @@ mod tests {
             id: "id-other".to_string(),
             name: "other-1".to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -532,6 +642,7 @@ mod tests {
             id: "id-cache".to_string(),
             name: "cache-1".to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
@@ -555,6 +666,7 @@ mod tests {
             id: "id-missing".to_string(),
             name: "missing-1".to_string(),
             port: Some(8000),
+            tcp_expose: None,
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
