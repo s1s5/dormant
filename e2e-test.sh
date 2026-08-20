@@ -9,7 +9,7 @@
 # 実行:
 #   ./e2e-test.sh
 #
-# 検証パターン: E1 〜 E28 (plan-e2e-test.md, plan-e2e-ip-change.md 参照)
+# 検証パターン: E1 〜 E37 (plan-e2e-test.md, plan-e2e-ip-change.md 参照)
 #   各パターンを関数化し、pass/fail を判定して最後にサマリを表示する。
 #   テスト用コンテナはすべて <PREFIX>-* という名前で作成し、
 #   スクリプト終了時に trap 経由で必ず削除する。
@@ -922,6 +922,59 @@ test_e36() {
 }
 
 # ---------------------------------------------------------------------------
+# L. 複数ポート・複数ドメイン振り分け (E37)
+# ---------------------------------------------------------------------------
+
+# E37: 1コンテナの複数ポートを複数ドメインで振り分け
+# 検証: dormant.host='domainA:port1,domainB:port2' の1コンテナに、
+#       domainA へのアクセスは port1、domainB へのアクセスは port2 に転送される。
+# 方法: nginx 1台に2つの待ち受け(80/8080)を立て、それぞれで異なるHTMLを返す。
+#       dormant.host でドメインごとに転送先ポートを指定する。
+test_e37() {
+    local code
+    code=$(mktemp /tmp/dormant-multiport.XXXXXX.conf)
+    # nginx が 80 と 8080 で別コンテンツを返す設定
+    cat > "$code" <<'CONF'
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    location / { return 200 "port80\n"; }
+}
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    location / { return 200 "port8080\n"; }
+}
+CONF
+    docker run -d --name "$PREFIX-mp" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label "dormant.host=mp80.example.localhost:80,mp8080.example.localhost:8080" \
+        -v "$code":/etc/nginx/conf.d/multi.conf:ro \
+        nginx:alpine >/dev/null 2>&1
+    local rc=$?
+    rm -f "$code"
+    [ $rc -eq 0 ] || return 1
+
+    # domainA (port80) へのアクセス → "port80"
+    local deadline=$((SECONDS + 30))
+    local body80 body8080
+    while (( SECONDS < deadline )); do
+        body80=$(curl -s -m 10 -H "Host: mp80.example.localhost" "$BASE_URL/") || body80=""
+        body8080=$(curl -s -m 10 -H "Host: mp8080.example.localhost" "$BASE_URL/") || body8080=""
+        if [ "$body80" = "port80" ] && [ "$body8080" = "port8080" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 main() {
@@ -974,6 +1027,7 @@ main() {
     run_test "E34 TCP 転送 (エコーバック)" test_e34
     run_test "E35 TCP 転送 (dormant.tcp 別ポート)" test_e35
     run_test "E36 TCP 接続中は停止しない" test_e36
+    run_test "E37 複数ドメインで複数ポートを振り分け (200)" test_e37
 
     # サマリ
     echo

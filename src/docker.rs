@@ -34,6 +34,16 @@ pub struct TcpExpose {
     pub container_port: u16,
 }
 
+/// ルーティングエントリ(dormant.host ラベル由来)
+/// `host:port` 形式で指定し、port は省略可能(省略時はコンテナのデフォルトポートへ振り分け)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// ルーティング用ホスト名
+    pub host: String,
+    /// 転送先ポート(未指定は None = コンテナのデフォルトポート)
+    pub port: Option<u16>,
+}
+
 /// dormant 管理対象コンテナの情報
 #[derive(Debug, Clone)]
 pub struct ManagedContainer {
@@ -43,8 +53,8 @@ pub struct ManagedContainer {
     pub name: String,
     /// 公開ポート(依存専用コンテナなど未指定の場合は None)
     pub port: Option<u16>,
-    /// TCP転送の公開設定(dormant.tcp ラベルで指定)
-    pub tcp_expose: Option<TcpExpose>,
+    /// TCP転送の公開設定(dormant.tcp ラベルで指定、複数可)
+    pub tcp_expose: Vec<TcpExpose>,
     /// 所属グループ
     pub group: Option<String>,
     /// セッション保持時間
@@ -57,8 +67,8 @@ pub struct ManagedContainer {
     pub healthcheck_port: Option<u16>,
     /// ヘルスチェック許容ステータス(あれば)
     pub healthcheck_status: Option<Vec<u16>>,
-    /// ラベル指定のホスト名(カンマ区切り)
-    pub hosts: Vec<String>,
+    /// ルーティングエントリ(dormant.host ラベル由来、host[:port] のカンマ区切り)
+    pub routes: Vec<Route>,
     /// コンテナIP(ネットワーク解決用)
     pub ip: Option<String>,
     /// running状態か
@@ -316,14 +326,10 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
                 .collect::<Vec<u16>>()
         })
         .filter(|v| !v.is_empty());
-    let hosts = labels
+    // dormant.host ラベル: `host[:port]` のカンマ区切り。port 省略時はデフォルトポートへ
+    let routes = labels
         .get(LABEL_HOST)
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<String>>()
-        })
+        .map(|v| parse_routes(v))
         .unwrap_or_default();
 
     // depends_on: `サービス名:コンディション:必須フラグ` のカンマ区切り
@@ -344,10 +350,11 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         })
         .unwrap_or_default();
 
-    // dormant.tcp ラベル: `PORT` または `LISTEN_PORT:CONTAINER_PORT`
+    // dormant.tcp ラベル: `PORT` / `LISTEN_PORT:CONTAINER_PORT` のカンマ区切り(複数可)
     let tcp_expose = labels
         .get(LABEL_TCP)
-        .and_then(|v| parse_tcp_expose(v));
+        .map(|v| parse_tcp_exposes(v))
+        .unwrap_or_default();
 
     Some(ManagedContainer {
         id,
@@ -360,7 +367,7 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         healthcheck_path: labels.get(LABEL_HEALTHCHECK_PATH).cloned(),
         healthcheck_port,
         healthcheck_status,
-        hosts,
+        routes,
         ip: None,
         running: c.state == Some(ContainerSummaryStateEnum::RUNNING),
         created: c.created,
@@ -409,7 +416,50 @@ fn parse_duration(v: Option<&str>, default: &str) -> Duration {
         .unwrap_or_else(|| humantime::parse_duration(default).unwrap())
 }
 
+/// dormant.host ラベルをパースする
+/// 形式: `host` または `host:port` のカンマ区切り
+fn parse_routes(v: &str) -> Vec<Route> {
+    v.split(',')
+        .map(|s| parse_route(s.trim()))
+        .filter_map(|r| r)
+        .collect()
+}
+
+/// 単一のルーティングエントリをパースする
+/// 形式: `host` または `host:port`
+fn parse_route(s: &str) -> Option<Route> {
+    if s.is_empty() {
+        return None;
+    }
+    // host:port 形式(最後の ':' を区切りとして扱う。IPv6は非対応)
+    match s.rsplit_once(':') {
+        Some((host, port_str)) => match port_str.parse::<u16>() {
+            Ok(port) if port != 0 => Some(Route {
+                host: host.to_string(),
+                port: Some(port),
+            }),
+            // ポート部分が数字でない場合は host 全体をドメインとして扱う
+            _ => Some(Route {
+                host: s.to_string(),
+                port: None,
+            }),
+        },
+        None => Some(Route {
+            host: s.to_string(),
+            port: None,
+        }),
+    }
+}
+
 /// dormant.tcp ラベルをパースする
+/// 形式: `PORT` / `LISTEN_PORT:CONTAINER_PORT` のカンマ区切り(複数可)
+fn parse_tcp_exposes(v: &str) -> Vec<TcpExpose> {
+    v.split(',')
+        .filter_map(|s| parse_tcp_expose(s.trim()))
+        .collect()
+}
+
+/// 単一の dormant.tcp ラベル要素をパースする
 /// 形式: `PORT` → listen もコンテナも同じポート
 ///       `LISTEN_PORT:CONTAINER_PORT` → 別ポートを指定
 fn parse_tcp_expose(v: &str) -> Option<TcpExpose> {
@@ -501,6 +551,88 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tcp_exposes_multi() {
+        // カンマ区切りで複数指定可能
+        assert_eq!(
+            parse_tcp_exposes("6334:9000,6379"),
+            vec![
+                TcpExpose {
+                    listen_port: 6334,
+                    container_port: 9000,
+                },
+                TcpExpose {
+                    listen_port: 6379,
+                    container_port: 6379,
+                },
+            ]
+        );
+        // 空要素は無視
+        assert_eq!(
+            parse_tcp_exposes("6334,,6379"),
+            vec![
+                TcpExpose {
+                    listen_port: 6334,
+                    container_port: 6334,
+                },
+                TcpExpose {
+                    listen_port: 6379,
+                    container_port: 6379,
+                },
+            ]
+        );
+        assert_eq!(parse_tcp_exposes(""), Vec::<TcpExpose>::new());
+    }
+
+    #[test]
+    fn test_parse_route() {
+        // host のみ (ポートなし = デフォルト)
+        assert_eq!(
+            parse_route("app.example.com"),
+            Some(Route {
+                host: "app.example.com".to_string(),
+                port: None,
+            })
+        );
+        // host:port 形式
+        assert_eq!(
+            parse_route("api.example.com:8080"),
+            Some(Route {
+                host: "api.example.com".to_string(),
+                port: Some(8080),
+            })
+        );
+        // 空は None
+        assert_eq!(parse_route(""), None);
+        // ポート部分が数字でない場合は host 全体として扱う
+        assert_eq!(
+            parse_route("host-with-colon:abc"),
+            Some(Route {
+                host: "host-with-colon:abc".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_routes_multi() {
+        // カンマ区切り + 一部のみポート付き
+        assert_eq!(
+            parse_routes("api.example.com:8080, web.example.com"),
+            vec![
+                Route {
+                    host: "api.example.com".to_string(),
+                    port: Some(8080),
+                },
+                Route {
+                    host: "web.example.com".to_string(),
+                    port: None,
+                },
+            ]
+        );
+        assert_eq!(parse_routes(""), Vec::<Route>::new());
+    }
+
+    #[test]
     fn test_parse_container_tcp_expose() {
         let mut labels = HashMap::new();
         labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
@@ -514,10 +646,10 @@ mod tests {
         let m = parse_container(&c).unwrap();
         assert_eq!(
             m.tcp_expose,
-            Some(TcpExpose {
+            vec![TcpExpose {
                 listen_port: 6334,
                 container_port: 9000,
-            })
+            }]
         );
     }
 
@@ -536,8 +668,17 @@ mod tests {
         };
         let m = parse_container(&c).unwrap();
         assert_eq!(
-            m.hosts,
-            vec!["app.example.com".to_string(), "api.example.com".to_string()]
+            m.routes,
+            vec![
+                Route {
+                    host: "app.example.com".to_string(),
+                    port: None,
+                },
+                Route {
+                    host: "api.example.com".to_string(),
+                    port: None,
+                },
+            ]
         );
         assert_eq!(m.healthcheck_status, Some(vec![200, 204]));
     }
@@ -575,14 +716,14 @@ mod tests {
             id: "id-dep".to_string(),
             name: "/dep-1".to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -594,14 +735,14 @@ mod tests {
             id: "id-app".to_string(),
             name: "app-1".to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -623,14 +764,14 @@ mod tests {
             id: "id-other".to_string(),
             name: "other-1".to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -642,14 +783,14 @@ mod tests {
             id: "id-cache".to_string(),
             name: "cache-1".to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -666,14 +807,14 @@ mod tests {
             id: "id-missing".to_string(),
             name: "missing-1".to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: None,
             running: false,
             created: None,

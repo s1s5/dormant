@@ -135,6 +135,17 @@ async fn handle_conn(
         return;
     };
 
+    // この待ち受けポートに対応するコンテナ側ポートを特定
+    let Some(container_port) = container
+        .tcp_expose
+        .iter()
+        .find(|e| e.listen_port == port)
+        .map(|e| e.container_port)
+    else {
+        tracing::warn!("tcp: container {} has no tcp expose for port {}", container.id, port);
+        return;
+    };
+
     // セッション記録 (アクセスでタイマーリセット)
     sessions
         .touch(&container.id, container.session_duration)
@@ -142,7 +153,14 @@ async fn handle_conn(
 
     // 起動待ち (成功時は転送先ホストが含まれるアドレスが返る)
     let containers = router.containers().await;
-    let started = match lifecycle::ensure_started(&docker, &container, &containers).await {
+    let started = match lifecycle::ensure_started_with_port(
+        &docker,
+        &container,
+        &containers,
+        Some(container_port),
+    )
+    .await
+    {
         Ok(addr) => addr,
         Err(e) => {
             tracing::warn!(
@@ -156,10 +174,6 @@ async fn handle_conn(
     };
 
     // 転送先アドレス (ensure_started が返すホスト + tcp コンテナ側ポート)
-    let Some(container_port) = container.tcp_expose.as_ref().map(|e| e.container_port) else {
-        tracing::warn!("tcp: container {} has no tcp expose", container.id);
-        return;
-    };
     let host = started
         .rsplit_once(':')
         .map(|(h, _)| h.to_string())
@@ -219,10 +233,10 @@ mod tests {
         mc.port = port;
         mc.running = running;
         let mut c = testutil::make_container(id, None);
-        c.tcp_expose = Some(crate::docker::TcpExpose {
+        c.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port,
             container_port: port,
-        });
+        }];
         // ensure_started は port で疎通確認するため、tcp の転送先ポートと合わせる
         c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
@@ -262,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_forward() {
         let (mc, c) = tcp_setup("tcp-app", true).await;
-        let listen_port = c.tcp_expose.as_ref().unwrap().listen_port;
+        let listen_port = c.tcp_expose[0].listen_port;
         spawn_tcp_proxy(&mc, c).await;
         assert!(wait_echo(listen_port).await);
     }
@@ -283,7 +297,7 @@ mod tests {
     async fn test_tcp_auto_start() {
         // 停止状態のコンテナに接続 → dormant が自動起動してから転送
         let (mc, c) = tcp_setup("tcp-on-demand", false).await;
-        let listen_port = c.tcp_expose.as_ref().unwrap().listen_port;
+        let listen_port = c.tcp_expose[0].listen_port;
         spawn_tcp_proxy(&mc, c).await;
         assert!(wait_echo(listen_port).await);
     }

@@ -6,12 +6,28 @@ use tokio::sync::RwLock;
 
 use crate::docker::ManagedContainer;
 
+/// ルートキー(Host名)に対応する候補エントリ
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    /// 候補コンテナ
+    pub container: ManagedContainer,
+    /// そのルートで使う転送ポート(None = コンテナのデフォルトポート)
+    pub port: Option<u16>,
+}
+
+impl RouteEntry {
+    /// running状態か
+    pub fn is_running(&self) -> bool {
+        self.container.is_running()
+    }
+}
+
 /// ルーティングテーブル
 /// key: Host名(例: "graphql.sb.carrot.localhost")
-/// value: そのホストの管理対象コンテナ候補リスト
+/// value: そのホストの管理対象コンテナ候補リスト(転送ポート情報付き)
 #[derive(Clone, Default)]
 pub struct Router {
-    inner: Arc<RwLock<HashMap<String, Vec<ManagedContainer>>>>,
+    inner: Arc<RwLock<HashMap<String, Vec<RouteEntry>>>>,
     /// TCP転送用のルーティング表
     /// key: dormant 側の待ち受けポート
     /// value: そのポートの管理対象コンテナ候補リスト
@@ -42,17 +58,17 @@ impl Router {
                 _ => trimmed.to_string(),
             };
 
-            // コンテナ名由来の導出キーは従来どおり残す(後方互換)
-            Self::add(&mut map, name, &c);
+            // コンテナ名由来の導出キーは従来どおり残す(後方互換、デフォルトポート)
+            Self::add(&mut map, name, &c, None);
 
             // ラベルで明示指定があればそれも使う
-            // dormant.host ラベル: カンマ区切りで複数ホストを登録
-            for host in &c.hosts {
-                Self::add(&mut map, host.clone(), &c);
+            // dormant.host ラベル: `host[:port]` のカンマ区切りで複数ルートを登録
+            for route in &c.routes {
+                Self::add(&mut map, route.host.clone(), &c, route.port);
             }
 
             // TCP転送: dormant.tcp で公開するポートを登録
-            if let Some(expose) = &c.tcp_expose {
+            for expose in &c.tcp_expose {
                 Self::add_tcp(&mut tcp_map, expose.listen_port, &c);
             }
         }
@@ -61,10 +77,18 @@ impl Router {
     }
 
     /// 候補リストに追加(同一コンテナIDは重複追加しない)
-    fn add(map: &mut HashMap<String, Vec<ManagedContainer>>, host: String, c: &ManagedContainer) {
+    fn add(
+        map: &mut HashMap<String, Vec<RouteEntry>>,
+        host: String,
+        c: &ManagedContainer,
+        port: Option<u16>,
+    ) {
         let v = map.entry(host).or_default();
-        if !v.iter().any(|x| x.id == c.id) {
-            v.push(c.clone());
+        if !v.iter().any(|x| x.container.id == c.id) {
+            v.push(RouteEntry {
+                container: c.clone(),
+                port,
+            });
         }
     }
 
@@ -77,30 +101,47 @@ impl Router {
     }
 
     /// 候補リストから選択: running 優先、次に作成日時が新しい方を優先
-    fn pick(candidates: &[ManagedContainer]) -> Option<ManagedContainer> {
+    fn pick(candidates: &[RouteEntry]) -> Option<RouteEntry> {
         candidates
             .iter()
-            .max_by(|a, b| (a.is_running(), a.created).cmp(&(b.is_running(), b.created)))
+            .max_by(|a, b| {
+                (a.is_running(), a.container.created).cmp(&(b.is_running(), b.container.created))
+            })
             .cloned()
     }
 
-    /// Host名からコンテナを解決
-    pub async fn resolve(&self, host: &str) -> Option<ManagedContainer> {
+    /// Host名から解決済みルート(コンテナ + 転送ポート)を取得
+    /// ポート未指定ルートはコンテナのデフォルトポートに解決する
+    pub async fn resolve(&self, host: &str) -> Option<(ManagedContainer, u16)> {
         let map = self.inner.read().await;
         // 完全一致 → 前方一致(サブドメイン)の順で探す
-        if let Some(c) = map.get(host).and_then(|v| Self::pick(v)) {
-            return Some(c);
+        if let Some(e) = map.get(host).and_then(|v| Self::pick(v)) {
+            return Some(resolved_port(e));
         }
         // 前方一致: "foo.bar.localhost" に対する "bar.localhost"
         map.iter()
             .find(|(k, _)| host.ends_with(k.as_str()) && host.len() > k.len())
             .and_then(|(_, v)| Self::pick(v))
+            .map(resolved_port)
+    }
+
+    /// Host名からコンテナのみを解決(デフォルトポート使用、後方互換)
+    pub async fn resolve_container(&self, host: &str) -> Option<ManagedContainer> {
+        self.resolve(host).await.map(|(c, _)| c)
     }
 
     /// TCP待ち受けポートからコンテナを解決
     pub async fn resolve_tcp(&self, listen_port: u16) -> Option<ManagedContainer> {
         let map = self.tcp_listen.read().await;
-        map.get(&listen_port).and_then(|v| Self::pick(v))
+        map.get(&listen_port).and_then(|v| Self::pick_tcp(v))
+    }
+
+    /// TCP候補リストから選択: running 優先、次に作成日時が新しい方を優先
+    fn pick_tcp(candidates: &[ManagedContainer]) -> Option<ManagedContainer> {
+        candidates
+            .iter()
+            .max_by(|a, b| (a.is_running(), a.created).cmp(&(b.is_running(), b.created)))
+            .cloned()
     }
 
     /// 登録されているTCP待ち受けポート一覧
@@ -114,6 +155,7 @@ impl Router {
         let mut seen = HashSet::new();
         map.values()
             .flatten()
+            .map(|e| &e.container)
             .filter(|c| seen.insert(c.id.clone()))
             .cloned()
             .collect()
@@ -125,6 +167,7 @@ impl Router {
         let mut seen = HashSet::new();
         map.values()
             .flatten()
+            .map(|e| &e.container)
             .filter(|c| c.group.as_deref() == Some(group))
             .filter(|c| seen.insert(c.id.clone()))
             .cloned()
@@ -140,10 +183,19 @@ impl Router {
     }
 }
 
+/// ルートエントリを解決済み(コンテナ, ポート)に変換する。
+/// ポート未指定ならコンテナのデフォルトポートを使用
+fn resolved_port(e: RouteEntry) -> (ManagedContainer, u16) {
+    let port = e.port.or(e.container.port);
+    let port = port.unwrap_or(0);
+    (e.container, port)
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::docker::Route;
     use std::time::Duration;
 
     fn make_container(name: &str, group: Option<&str>) -> ManagedContainer {
@@ -151,20 +203,36 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: group.map(|s| s.to_string()),
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: Some("172.20.0.99".to_string()),
             running: false,
             created: None,
             depends_on: Vec::new(),
             compose_project: None,
             compose_service: None,
+        }
+    }
+
+    /// テスト用ルート(ポートなし = デフォルトポート)
+    fn route(host: &str) -> Route {
+        Route {
+            host: host.to_string(),
+            port: None,
+        }
+    }
+
+    /// テスト用ルート(ポート付き)
+    fn route_port(host: &str, port: u16) -> Route {
+        Route {
+            host: host.to_string(),
+            port: Some(port),
         }
     }
 
@@ -213,7 +281,7 @@ mod tests {
     async fn test_resolve_host_label() {
         let router = Router::new();
         let mut c = make_container("/app-1", None);
-        c.hosts = vec!["app.example.com".to_string()];
+        c.routes = vec![route("app.example.com")];
         router.update(vec![c]).await;
 
         assert!(router.resolve("app.example.com").await.is_some());
@@ -225,14 +293,49 @@ mod tests {
     async fn test_resolve_multiple_host_labels() {
         let router = Router::new();
         let mut c = make_container("/app-1", None);
-        c.hosts = vec![
-            "app.example.com".to_string(),
-            "api.example.com".to_string(),
-        ];
+        c.routes = vec![route("app.example.com"), route("api.example.com")];
         router.update(vec![c]).await;
 
         assert!(router.resolve("app.example.com").await.is_some());
         assert!(router.resolve("api.example.com").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_route_port() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.routes = vec![route_port("app.example.com", 8080)];
+        router.update(vec![c]).await;
+
+        let (c, port) = router.resolve("app.example.com").await.unwrap();
+        assert_eq!(c.id, "id-/app-1");
+        assert_eq!(port, 8080);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_route_no_port_falls_back_to_default() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.port = Some(9000);
+        c.routes = vec![route("app.example.com")];
+        router.update(vec![c]).await;
+
+        let (_, port) = router.resolve("app.example.com").await.unwrap();
+        assert_eq!(port, 9000);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_multiple_routes_same_container_different_ports() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.port = Some(9000);
+        c.routes = vec![route_port("api.example.com", 8081), route_port("web.example.com", 8080)];
+        router.update(vec![c]).await;
+
+        let (_, port_a) = router.resolve("api.example.com").await.unwrap();
+        let (_, port_w) = router.resolve("web.example.com").await.unwrap();
+        assert_eq!(port_a, 8081);
+        assert_eq!(port_w, 8080);
     }
 
     #[tokio::test]
@@ -242,11 +345,11 @@ mod tests {
         let mut running = make_container("/new-1", None);
         stopped.running = false;
         running.running = true;
-        stopped.hosts = vec!["app.example.com".to_string()];
-        running.hosts = vec!["app.example.com".to_string()];
+        stopped.routes = vec![route("app.example.com")];
+        running.routes = vec![route("app.example.com")];
         router.update(vec![stopped, running]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -258,11 +361,11 @@ mod tests {
         let mut stopped = make_container("/new-1", None);
         running.running = true;
         stopped.running = false;
-        running.hosts = vec!["app.example.com".to_string()];
-        stopped.hosts = vec!["app.example.com".to_string()];
+        running.routes = vec![route("app.example.com")];
+        stopped.routes = vec![route("app.example.com")];
         router.update(vec![running, stopped]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/old-1");
     }
@@ -276,11 +379,11 @@ mod tests {
         second.running = false;
         first.created = Some(1000);
         second.created = Some(2000);
-        first.hosts = vec!["app.example.com".to_string()];
-        second.hosts = vec!["app.example.com".to_string()];
+        first.routes = vec![route("app.example.com")];
+        second.routes = vec![route("app.example.com")];
         router.update(vec![first, second]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(!c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -294,12 +397,12 @@ mod tests {
         new.running = false;
         old.created = Some(1000);
         new.created = Some(2000);
-        old.hosts = vec!["app.example.com".to_string()];
-        new.hosts = vec!["app.example.com".to_string()];
+        old.routes = vec![route("app.example.com")];
+        new.routes = vec![route("app.example.com")];
         // 新しい方が後に並んでも勝つ(後勝ちではなく作成日時優先)
         router.update(vec![new, old]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(!c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -313,11 +416,11 @@ mod tests {
         new.running = true;
         old.created = Some(1000);
         new.created = Some(2000);
-        old.hosts = vec!["app.example.com".to_string()];
-        new.hosts = vec!["app.example.com".to_string()];
+        old.routes = vec![route("app.example.com")];
+        new.routes = vec![route("app.example.com")];
         router.update(vec![old, new]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -331,12 +434,12 @@ mod tests {
         stopped_new.running = false;
         running_old.created = Some(1000);
         stopped_new.created = Some(2000);
-        running_old.hosts = vec!["app.example.com".to_string()];
-        stopped_new.hosts = vec!["app.example.com".to_string()];
+        running_old.routes = vec![route("app.example.com")];
+        stopped_new.routes = vec![route("app.example.com")];
         // 新規が後に来ても、running の既存が優先(R2)
         router.update(vec![running_old, stopped_new]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/old-1");
     }
@@ -350,12 +453,12 @@ mod tests {
         running_new.running = true;
         stopped_old.created = Some(2000);
         running_new.created = Some(1000);
-        stopped_old.hosts = vec!["app.example.com".to_string()];
-        running_new.hosts = vec!["app.example.com".to_string()];
+        stopped_old.routes = vec![route("app.example.com")];
+        running_new.routes = vec![route("app.example.com")];
         // 既存の作成日時が新しくても running の新規が優先(R1)
         router.update(vec![stopped_old, running_new]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -369,11 +472,11 @@ mod tests {
         running.running = true;
         stopped.created = Some(3000);
         running.created = Some(1000);
-        stopped.hosts = vec!["app.example.com".to_string()];
-        running.hosts = vec!["app.example.com".to_string()];
+        stopped.routes = vec![route("app.example.com")];
+        running.routes = vec![route("app.example.com")];
         router.update(vec![stopped, running]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -387,11 +490,11 @@ mod tests {
         new.running = false;
         old.created = Some(1000);
         new.created = Some(2000);
-        old.hosts = vec!["app.example.com".to_string()];
-        new.hosts = vec!["app.example.com".to_string()];
+        old.routes = vec![route("app.example.com")];
+        new.routes = vec![route("app.example.com")];
         router.update(vec![old, new]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(!c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -405,11 +508,11 @@ mod tests {
         new.running = true;
         old.created = Some(1000);
         new.created = Some(2000);
-        old.hosts = vec!["app.example.com".to_string()];
-        new.hosts = vec!["app.example.com".to_string()];
+        old.routes = vec![route("app.example.com")];
+        new.routes = vec![route("app.example.com")];
         router.update(vec![old, new]).await;
 
-        let c = router.resolve("app.example.com").await.unwrap();
+        let (c, _) = router.resolve("app.example.com").await.unwrap();
         assert!(c.is_running());
         assert_eq!(c.id, "id-/new-1");
     }
@@ -418,10 +521,7 @@ mod tests {
     async fn test_containers_unique() {
         let router = Router::new();
         let mut c = make_container("/app-1", None);
-        c.hosts = vec![
-            "app.example.com".to_string(),
-            "api.example.com".to_string(),
-        ];
+        c.routes = vec![route("app.example.com"), route("api.example.com")];
         router.update(vec![c]).await;
 
         // 名前由来キー + ホストラベル2つ → 同一コンテナが複数キーに現れるが一覧は1件
@@ -452,10 +552,10 @@ mod tests {
     async fn test_resolve_tcp_port() {
         let router = Router::new();
         let mut c = make_container("/app-1", None);
-        c.tcp_expose = Some(crate::docker::TcpExpose {
+        c.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 9000,
-        });
+        }];
         router.update(vec![c]).await;
 
         let c = router.resolve_tcp(6334).await.unwrap();
@@ -467,15 +567,15 @@ mod tests {
     async fn test_tcp_listen_ports() {
         let router = Router::new();
         let mut a = make_container("/a-1", None);
-        a.tcp_expose = Some(crate::docker::TcpExpose {
+        a.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 6334,
-        });
+        }];
         let mut b = make_container("/b-1", None);
-        b.tcp_expose = Some(crate::docker::TcpExpose {
+        b.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 7000,
             container_port: 8000,
-        });
+        }];
         router.update(vec![a, b]).await;
 
         let mut ports = router.tcp_listen_ports().await;
@@ -492,14 +592,14 @@ mod tests {
         running.running = true;
         stopped.created = Some(3000);
         running.created = Some(1000);
-        stopped.tcp_expose = Some(crate::docker::TcpExpose {
+        stopped.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 6334,
-        });
-        running.tcp_expose = Some(crate::docker::TcpExpose {
+        }];
+        running.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 6334,
-        });
+        }];
         router.update(vec![stopped, running]).await;
 
         let c = router.resolve_tcp(6334).await.unwrap();
@@ -516,14 +616,14 @@ mod tests {
         new.running = false;
         old.created = Some(1000);
         new.created = Some(2000);
-        old.tcp_expose = Some(crate::docker::TcpExpose {
+        old.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 6334,
-        });
-        new.tcp_expose = Some(crate::docker::TcpExpose {
+        }];
+        new.tcp_expose = vec![crate::docker::TcpExpose {
             listen_port: 6334,
             container_port: 6334,
-        });
+        }];
         router.update(vec![old, new]).await;
 
         let c = router.resolve_tcp(6334).await.unwrap();

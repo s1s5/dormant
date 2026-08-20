@@ -149,17 +149,28 @@ pub fn stop_chain(
     out
 }
 
-/// コンテナを起動し、依存先を先に起動してから本体を起動する
+/// コンテナを起動し、依存先を先に起動してから本体を起動する(デフォルトポート使用)
 pub async fn ensure_started(
     docker: &DockerClient,
     container: &ManagedContainer,
     containers: &[ManagedContainer],
 ) -> Result<String> {
+    ensure_started_with_port(docker, container, containers, container.port).await
+}
+
+/// コンテナを起動し、依存先を先に起動してから本体を起動する(ポート指定可能)
+/// port は転送先・疎通確認に使う。None の場合はコンテナのデフォルトポートを使う
+pub async fn ensure_started_with_port(
+    docker: &DockerClient,
+    container: &ManagedContainer,
+    containers: &[ManagedContainer],
+    port: Option<u16>,
+) -> Result<String> {
     let levels = dependency_levels_multi(std::slice::from_ref(container), containers, MAX_DEPENDENCY_DEPTH);
     for level in levels.iter().take(levels.len().saturating_sub(1)) {
         start_level(docker, level).await?;
     }
-    ensure_started_single(docker, container).await
+    ensure_started_single(docker, container, port).await
 }
 
 /// 依存関係をレベル別(深い順)に並べる。各レベルは並列起動可能
@@ -241,7 +252,7 @@ async fn start_level(
         let c = c.clone();
         let cond = cond.clone();
         handles.push(tokio::spawn(async move {
-            ensure_started_single(&docker, &c).await?;
+            ensure_started_single(&docker, &c, c.port).await?;
             if cond.as_deref() == Some("service_healthy") {
                 wait_healthy(&docker, &c).await?;
             }
@@ -271,14 +282,16 @@ async fn wait_healthy(docker: &DockerClient, c: &ManagedContainer) -> Result<()>
 }
 
 /// コンテナを起動し、ポートがlistenするまで待つ
+/// port: 転送・疎通確認に使うポート。None ならコンテナのデフォルトポート
 async fn ensure_started_single(
     docker: &DockerClient,
     container: &ManagedContainer,
+    port: Option<u16>,
 ) -> Result<String> {
     // すでに起動済みならOK(IPは起動後に取り直す)
     if docker.is_running(&container.id).await? {
         if let Ok(ip) = docker.resolve_ip(&container.id).await {
-            return Ok(addr_with_port(&ip, container.port));
+            return Ok(addr_with_port(&ip, port));
         }
         return Ok(container.target_addr());
     }
@@ -305,7 +318,7 @@ async fn ensure_started_single(
         // 停止中コンテナはIPが空のため、起動後に取り直す
         if let Ok(ip) = docker.resolve_ip(&container.id).await {
             // ポート未指定(依存専用コンテナ)は running になった時点で ready
-            let Some(port) = container.port else {
+            let Some(port) = port else {
                 tracing::info!("container {} is ready at {}", container.name, ip);
                 return Ok(ip);
             };
@@ -555,14 +568,14 @@ mod tests {
             id: id.to_string(),
             name: format!("/{}-{}", project, service),
             port: Some(8000),
-            tcp_expose: None,
+            tcp_expose: Vec::new(),
             group: None,
             session_duration: Duration::from_secs(3600),
             startup_timeout: Duration::from_secs(180),
             healthcheck_path: None,
             healthcheck_port: None,
             healthcheck_status: None,
-            hosts: Vec::new(),
+            routes: Vec::new(),
             ip: Some("172.20.0.99".to_string()),
             running: false,
             created: None,

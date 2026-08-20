@@ -72,8 +72,8 @@ docker run -d --name myapp \
 |--------|------|
 | `dormant.enable` | `true` で管理対象にする |
 | `dormant.port` | 転送先ポート（未指定なら公開ポート / 依存専用コンテナは IP のみ） |
-| `dormant.host` | ルーティング用ホスト名（カンマ区切りで複数） |
-| `dormant.tcp` | TCP転送。`PORT`（listen=コンテナ=同一）または `LISTEN_PORT:CONTAINER_PORT` |
+| `dormant.host` | ルーティング用ホスト名。`host[:port]` 形式のカンマ区切りで複数指定可能。ポート省略時は `dormant.port`（または公開ポート）へ振り分け |
+| `dormant.tcp` | TCP転送。`PORT`（listen=コンテナ=同一）または `LISTEN_PORT:CONTAINER_PORT`、カンマ区切りで複数 |
 | `dormant.group` | グループ名。同一グループを連動起動・停止 |
 | `dormant.session-duration` | セッション保持時間（例 `30m`, `2h`。既定 `1h`） |
 | `dormant.startup.timeout` | 起動タイムアウト（既定 `3m`） |
@@ -102,6 +102,24 @@ docker run -d --name mytcp \
 - `dormant.tcp=PORT` … dormant は `PORT` で待ち受け、コンテナの `PORT` へ転送。
 - `dormant.tcp=LISTEN_PORT:CONTAINER_PORT` … dormant は `LISTEN_PORT` で待ち受け、コンテナの `CONTAINER_PORT` へ転送。
 - コンテナ側の疎通確認には `dormant.port`（または `dormant.tcp` のコンテナ側ポート）を使います。
+
+### 複数ポートの振り分け
+
+`dormant.host` に `host:port` 形式で指定すると、一つのコンテナの複数ポートをドメインごとに振り分けられます。ポートを省略したエントリは `dormant.port`（または公開ポート）へ転送されます。
+
+```bash
+# 例: 同一コンテナで api.example.com → 8081、web.example.com → 8080、old.example.com → デフォルト(80)
+docker run -d --name myapp \
+  --label dormant.enable=true \
+  --label dormant.port=80 \
+  --label "dormant.host=api.example.com:8081,web.example.com:8080,old.example.com" \
+  myapp-image
+```
+
+- `dormant.host=host` … `dormant.port`（または公開ポート）へ振り分け（従来互換）
+- `dormant.host=host:port` … 指定したコンテナ側ポートへ振り分け
+- `dormant.host` はカンマ区切りで複数ドメインを登録可能
+- 起動待ち・ヘルスチェックも解決された転送先ポートで行います
 
 ### 依存関係（compose）
 
@@ -157,7 +175,7 @@ HTTP クライアント              TCP クライアント
 
 ## 既知の制限 / TODO
 
-- 一つのコンテナに 2 つ以上のポートがある場合の対応
+- 現時点で特記事項はありません
 
 ## ライセンス
 

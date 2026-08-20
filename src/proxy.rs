@@ -122,8 +122,9 @@ async fn handle(
     // Hostヘッダー → HTTP/2 :authority の順でホストを解決
     let host = resolve_host(&req);
 
-    let container = match router.resolve(&host).await {
-        Some(c) => c,
+    // ホストから(コンテナ, 転送ポート)を解決
+    let (container, route_port) = match router.resolve(&host).await {
+        Some(r) => r,
         None => {
             tracing::warn!("no route for host: {}", host);
             return Ok(error_response("no route for host", StatusCode::NOT_FOUND));
@@ -166,6 +167,7 @@ async fn handle(
             ws_client,
             docker,
             container.clone(),
+            route_port,
             &containers,
             sessions,
         )
@@ -179,6 +181,7 @@ async fn handle(
         h2_client,
         docker,
         container,
+        route_port,
         &containers,
         sessions,
     )
@@ -201,26 +204,30 @@ async fn handle_http(
     h2_client: ProxyClient,
     docker: DockerClient,
     container: crate::docker::ManagedContainer,
+    route_port: u16,
     containers: &[crate::docker::ManagedContainer],
     sessions: Sessions,
 ) -> Result<BoxResp, Infallible> {
-    // 起動待ち(成功時は転送先アドレスが返る)
-    let target_addr = match lifecycle::ensure_started(&docker, &container, containers).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::warn!(
-                "startup failed for {} ({}): {}",
-                container.name,
-                container.id,
-                e
-            );
+    // 起動待ち(成功時は転送先アドレスが返る)。ルート指定ポートで疎通確認
+    let target_addr =
+        match lifecycle::ensure_started_with_port(&docker, &container, containers, Some(route_port))
+            .await
+        {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::warn!(
+                    "startup failed for {} ({}): {}",
+                    container.name,
+                    container.id,
+                    e
+                );
 
-            return Ok(error_response(
-                "container failed to start",
-                StatusCode::GATEWAY_TIMEOUT,
-            ));
-        }
-    };
+                return Ok(error_response(
+                    "container failed to start",
+                    StatusCode::GATEWAY_TIMEOUT,
+                ));
+            }
+        };
 
     // バックエンドへ転送(コンテナIP直アクセス)
     let path_and_query = req
@@ -282,20 +289,24 @@ async fn handle_ws(
     ws_client: WsClient,
     docker: DockerClient,
     container: crate::docker::ManagedContainer,
+    route_port: u16,
     containers: &[crate::docker::ManagedContainer],
     sessions: Sessions,
 ) -> Result<BoxResp, Infallible> {
-    // 起動待ち(成功時は転送先アドレスが返る)
-    let target_addr = match lifecycle::ensure_started(&docker, &container, containers).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::warn!("startup failed for ws {}: {}", container.name, e);
-            return Ok(error_response(
-                "container failed to start",
-                StatusCode::GATEWAY_TIMEOUT,
-            ));
-        }
-    };
+    // 起動待ち(成功時は転送先アドレスが返る)。ルート指定ポートで疎通確認
+    let target_addr =
+        match lifecycle::ensure_started_with_port(&docker, &container, containers, Some(route_port))
+            .await
+        {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::warn!("startup failed for ws {}: {}", container.name, e);
+                return Ok(error_response(
+                    "container failed to start",
+                    StatusCode::GATEWAY_TIMEOUT,
+                ));
+            }
+        };
 
     // パスとヘッダーを先に取得
     let path = req.uri().path().to_string();
@@ -498,6 +509,7 @@ fn error_response(body: &'static str, status: StatusCode) -> BoxResp {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use crate::docker::Route;
     use crate::testutil::{self, MockContainer};
     use http_body_util::Full;
     use std::sync::Arc;
@@ -540,7 +552,10 @@ mod tests {
         c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
-        c.hosts = vec![format!("{}.localhost", id)];
+        c.routes = vec![Route {
+            host: format!("{}.localhost", id),
+            port: None,
+        }];
         (MockContainer::new(id, ip, port), c)
     }
 
@@ -659,7 +674,10 @@ mod tests {
         c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
-        c.hosts = vec!["sse.localhost".to_string()];
+        c.routes = vec![Route {
+            host: "sse.localhost".to_string(),
+            port: None,
+        }];
         c.session_duration = Duration::from_millis(50);
 
         let sessions = Sessions::new();
@@ -733,7 +751,10 @@ mod tests {
         c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
-        c.hosts = vec!["grpc.localhost".to_string()];
+        c.routes = vec![Route {
+            host: "grpc.localhost".to_string(),
+            port: None,
+        }];
 
         let (addr, _mock) = spawn_proxy(vec![mc], vec![c]).await;
 
@@ -768,7 +789,10 @@ mod tests {
         c.port = Some(port);
         c.startup_timeout = Duration::from_secs(3);
         c.ip = Some(ip.to_string());
-        c.hosts = vec!["grpc.localhost".to_string()];
+        c.routes = vec![Route {
+            host: "grpc.localhost".to_string(),
+            port: None,
+        }];
 
         let (addr, _mock) = spawn_proxy(vec![mc], vec![c]).await;
 
