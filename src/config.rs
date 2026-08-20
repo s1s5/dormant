@@ -4,9 +4,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
-/// dormant のラベルプレフィックス
-pub const LABEL_PREFIX: &str = "dormant.";
-
 /// ラベルキー
 pub const LABEL_ENABLE: &str = "dormant.enable";
 pub const LABEL_GROUP: &str = "dormant.group";
@@ -30,7 +27,6 @@ pub const MAX_DEPENDENCY_DEPTH: usize = 10;
 /// デフォルト値
 pub const DEFAULT_SESSION_DURATION: &str = "1h";
 pub const DEFAULT_STARTUP_TIMEOUT: &str = "3m";
-pub const DEFAULT_HEALTHCHECK_INTERVAL: u64 = 2; // 秒
 
 /// 設定ファイル(dormant.yml)
 #[derive(Debug, Clone, Deserialize)]

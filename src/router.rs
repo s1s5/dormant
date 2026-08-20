@@ -125,11 +125,6 @@ impl Router {
             .map(resolved_port)
     }
 
-    /// Host名からコンテナのみを解決(デフォルトポート使用、後方互換)
-    pub async fn resolve_container(&self, host: &str) -> Option<ManagedContainer> {
-        self.resolve(host).await.map(|(c, _)| c)
-    }
-
     /// TCP待ち受けポートからコンテナを解決
     pub async fn resolve_tcp(&self, listen_port: u16) -> Option<ManagedContainer> {
         let map = self.tcp_listen.read().await;
@@ -176,10 +171,6 @@ impl Router {
 
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
-    }
-
-    pub async fn is_empty(&self) -> bool {
-        self.inner.read().await.is_empty()
     }
 }
 

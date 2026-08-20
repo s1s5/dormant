@@ -100,10 +100,6 @@ impl DockerClient {
         })
     }
 
-    pub fn inner(&self) -> &Docker {
-        &self.docker
-    }
-
     /// dormant 自身が接続しているネットワーク名を取得(初回のみ解決してキャッシュ)
     pub async fn self_networks(&self) -> HashSet<String> {
         if let Some(nets) = self.self_networks.read().await.as_ref() {
@@ -304,9 +300,9 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         .and_then(|v| v.parse::<u16>().ok())
         .or(healthcheck_port)
         .or_else(|| {
-            c.ports.as_ref().and_then(|ports| {
-                ports.iter().filter_map(|p| Some(p.private_port)).next()
-            })
+            c.ports
+                .as_ref()
+                .and_then(|ports| ports.iter().map(|p| p.private_port).next())
         });
 
     let session_duration = parse_duration(
@@ -420,8 +416,7 @@ fn parse_duration(v: Option<&str>, default: &str) -> Duration {
 /// 形式: `host` または `host:port` のカンマ区切り
 fn parse_routes(v: &str) -> Vec<Route> {
     v.split(',')
-        .map(|s| parse_route(s.trim()))
-        .filter_map(|r| r)
+        .filter_map(|s| parse_route(s.trim()))
         .collect()
 }
 

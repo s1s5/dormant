@@ -68,6 +68,7 @@ impl Sessions {
     }
 
     /// アクティブ接続数
+    #[cfg(test)]
     pub async fn active_count(&self, id: &str) -> usize {
         self.active_conns.read().await.get(id).copied().unwrap_or(0)
     }
@@ -86,10 +87,6 @@ impl Sessions {
     pub async fn remove(&self, id: &str) {
         self.inner.write().await.remove(id);
         self.active_conns.write().await.remove(id);
-    }
-
-    pub async fn len(&self) -> usize {
-        self.inner.read().await.len()
     }
 }
 
@@ -150,6 +147,8 @@ pub fn stop_chain(
 }
 
 /// コンテナを起動し、依存先を先に起動してから本体を起動する(デフォルトポート使用)
+/// テストから利用する簡便ラッパー。本番は ensure_started_with_port を使う
+#[cfg(test)]
 pub async fn ensure_started(
     docker: &DockerClient,
     container: &ManagedContainer,

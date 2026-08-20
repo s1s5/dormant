@@ -141,7 +141,7 @@ async fn handle(
     let is_ws = req
         .headers()
         .get("upgrade")
-        .map(|v| v.to_str().unwrap_or("").to_ascii_lowercase() == "websocket")
+        .map(|v| v.to_str().unwrap_or("").eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
 
     // グループ起動(G2: グループ内全コンテナを起動してから転送)
@@ -166,8 +166,7 @@ async fn handle(
             req,
             ws_client,
             docker,
-            container.clone(),
-            route_port,
+            (container.clone(), route_port),
             &containers,
             sessions,
         )
@@ -180,8 +179,7 @@ async fn handle(
         client,
         h2_client,
         docker,
-        container,
-        route_port,
+        (container, route_port),
         &containers,
         sessions,
     )
@@ -203,8 +201,7 @@ async fn handle_http(
     client: ProxyClient,
     h2_client: ProxyClient,
     docker: DockerClient,
-    container: crate::docker::ManagedContainer,
-    route_port: u16,
+    (container, route_port): (crate::docker::ManagedContainer, u16),
     containers: &[crate::docker::ManagedContainer],
     sessions: Sessions,
 ) -> Result<BoxResp, Infallible> {
@@ -267,7 +264,7 @@ async fn handle_http(
             let headers = resp.headers().clone();
             let body = resp
                 .into_body()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
                 .boxed();
             let stream = ActiveStream::new(BodyStream::new(body), sessions, container.id.clone());
             let mut out = Response::new(BodyExt::boxed(StreamBody::new(stream)));
@@ -288,8 +285,7 @@ async fn handle_ws(
     mut req: Request<Incoming>,
     ws_client: WsClient,
     docker: DockerClient,
-    container: crate::docker::ManagedContainer,
-    route_port: u16,
+    (container, route_port): (crate::docker::ManagedContainer, u16),
     containers: &[crate::docker::ManagedContainer],
     sessions: Sessions,
 ) -> Result<BoxResp, Infallible> {
@@ -350,7 +346,7 @@ async fn handle_ws(
                 // クライアントに101を返す
                 let mut resp101 = Response::new(
                     Empty::new()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                        .map_err(std::io::Error::other)
                         .boxed(),
                 );
                 *resp101.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -371,16 +367,16 @@ async fn handle_ws(
                     sessions.disconnect(&id).await;
                 });
 
-                return Ok(resp101);
+                Ok(resp101)
             } else {
                 let status = resp.status();
                 let body = resp
                     .into_body()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    .map_err(std::io::Error::other)
                     .boxed();
                 let mut out = Response::new(body);
                 *out.status_mut() = status;
-                return Ok(out);
+                Ok(out)
             }
         }
         Err(e) => {
@@ -490,7 +486,7 @@ impl<S> Drop for ActiveStream<S> {
 fn ok_response(body: &'static str) -> BoxResp {
     Response::new(
         Full::new(Bytes::from(body))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
             .boxed(),
     )
 }
@@ -498,7 +494,7 @@ fn ok_response(body: &'static str) -> BoxResp {
 fn error_response(body: &'static str, status: StatusCode) -> BoxResp {
     let mut resp = Response::new(
         Full::new(Bytes::from(body))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
             .boxed(),
     );
     *resp.status_mut() = status;
