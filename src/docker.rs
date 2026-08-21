@@ -94,6 +94,8 @@ pub struct DockerClient {
     docker: Docker,
     /// dormant 自身が接続しているネットワーク名(共有ネットワークのIP優先に使う)
     self_networks: Arc<RwLock<Option<HashSet<String>>>>,
+    /// dormant が起動したコンテナID(メモリ追跡。参照カウント0の回収対象判定に使う)
+    started_by_dormant: Arc<RwLock<HashSet<String>>>,
     /// テスト用: 自身のコンテナIDの上書き(/etc/hostname 解決の代わり)
     #[cfg(test)]
     self_id: Arc<RwLock<Option<String>>>,
@@ -105,6 +107,7 @@ impl DockerClient {
         Ok(Self {
             docker,
             self_networks: Arc::new(RwLock::new(None)),
+            started_by_dormant: Arc::new(RwLock::new(HashSet::new())),
             #[cfg(test)]
             self_id: Arc::new(RwLock::new(None)),
         })
@@ -297,7 +300,19 @@ impl DockerClient {
         self.docker
             .start_container(id, None::<StartContainerOptions>)
             .await?;
+        // dormant が起動したコンテナとして記録(参照カウント0の回収対象判定に使う)
+        self.started_by_dormant.write().await.insert(id.to_string());
         Ok(())
+    }
+
+    /// dormant が起動したコンテナID一覧(メモリ追跡)
+    pub async fn started_by_dormant(&self) -> HashSet<String> {
+        self.started_by_dormant.read().await.clone()
+    }
+
+    /// コンテナIDを dormant 起動記録から削除
+    pub async fn forget_started(&self, id: &str) {
+        self.started_by_dormant.write().await.remove(id);
     }
 
     /// コンテナを停止

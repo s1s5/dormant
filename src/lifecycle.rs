@@ -84,6 +84,23 @@ impl Sessions {
             .collect()
     }
 
+    /// アクセスがあり一定時間内、またはアクティブ接続中のコンテナID一覧
+    /// 参照カウント計算で「起動中の子」を判定するために使う
+    pub async fn active_sessions(&self) -> HashSet<String> {
+        let map = self.inner.read().await;
+        let active = self.active_conns.read().await;
+        map.iter()
+            .filter(|(_, s)| s.last_access.elapsed() <= s.duration)
+            .map(|(id, _)| id.clone())
+            .chain(
+                active
+                    .iter()
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(id, _)| id.clone()),
+            )
+            .collect()
+    }
+
     pub async fn remove(&self, id: &str) {
         self.inner.write().await.remove(id);
         self.active_conns.write().await.remove(id);
@@ -120,6 +137,20 @@ pub async fn idle_loop(
             }
             sessions.remove(&id).await;
         }
+
+        // 参照カウント0の回収: dormant が起動した補助コンテナで、
+        // 参照元の子が全てアクティブでないものを停止する
+        let containers = router.containers().await;
+        let active = sessions.active_sessions().await;
+        let started = docker.started_by_dormant().await;
+        for c in zero_ref_containers(&containers, &active, &started).await {
+            tracing::info!("no active referrers, stopping helper container {}", c.name);
+            if let Err(e) = docker.stop(&c.id).await {
+                tracing::warn!("failed to stop {}: {}", c.id, e);
+            }
+            docker.forget_started(&c.id).await;
+            sessions.remove(&c.id).await;
+        }
     }
 }
 
@@ -137,6 +168,10 @@ pub fn stop_chain(
             continue;
         }
         for dep in c.resolve_dependencies(containers) {
+            // 親が停止対象外の他のコンテナからも参照されている場合は止めない(共有依存保護)
+            if is_shared_dependency(&dep, containers, &visited) {
+                continue;
+            }
             if visited.insert(dep.id.clone()) {
                 out.push(dep.clone());
                 stack.push((dep, depth + 1));
@@ -144,6 +179,53 @@ pub fn stop_chain(
         }
     }
     out
+}
+
+/// dep を depends_on で参照しているコンテナのうち、
+/// 停止対象(visited)に含まれないものが他にあるか
+fn is_shared_dependency(
+    dep: &ManagedContainer,
+    containers: &[ManagedContainer],
+    visited: &HashSet<String>,
+) -> bool {
+    containers.iter().any(|c| {
+        c.id != dep.id
+            && !visited.contains(&c.id)
+            && c.resolve_dependencies(containers)
+                .iter()
+                .any(|d| d.id == dep.id)
+    })
+}
+
+/// 起動中だが、参照元の子が全て「アクティブでない」(参照カウント0)コンテナを返す
+/// 参照カウントは「アクセスがあり一定時間内、またはアクティブ接続中」の子の数で数える。
+/// dormant が起動したコンテナのみを対象にする(手動起動の実サービスは停止しない)。
+pub async fn zero_ref_containers(
+    containers: &[ManagedContainer],
+    active: &HashSet<String>,
+    started_by_dormant: &HashSet<String>,
+) -> Vec<ManagedContainer> {
+    containers
+        .iter()
+        .filter(|c| c.is_running())
+        .filter(|c| started_by_dormant.contains(&c.id))
+        .filter(|c| {
+            // このコンテナを depends_on で参照する子(参照元)
+            let referrers: Vec<_> = containers
+                .iter()
+                .filter(|x| {
+                    x.id != c.id
+                        && x.compose_project.as_deref() == c.compose_project.as_deref()
+                        && x.depends_on.iter().any(|d| {
+                            d.service == c.compose_service.as_deref().unwrap_or("")
+                        })
+                })
+                .collect();
+            // 参照元が存在し、かつ全てアクティブでない(参照カウント0)
+            !referrers.is_empty() && referrers.iter().all(|x| !active.contains(&x.id))
+        })
+        .cloned()
+        .collect()
 }
 
 /// コンテナを起動し、依存先を先に起動してから本体を起動する(デフォルトポート使用)
@@ -675,6 +757,109 @@ mod tests {
         // 依存サービス名 db はあるが project が違うので解決されない
         let chain = stop_chain(&a, &[a.clone(), c, other], 10);
         assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn test_stop_chain_shared_dependency_protected() {
+        // db を a と b が共有。a 停止時、b がまだ参照しているので db は止めない
+        let db = make_container("db", "db", "proj", vec![]);
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let b = make_container("b", "b", "proj", vec![dep("db", "service_started")]);
+        let chain = stop_chain(&a, &[db.clone(), a.clone(), b.clone()], 10);
+        let ids: Vec<_> = chain.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(!ids.contains(&"db"), "共有依存 db は停止対象外のはず");
+        assert!(!ids.contains(&"b"), "停止対象外の b は含まれないはず");
+    }
+
+    #[test]
+    fn test_stop_chain_shared_dependency_stops_when_last() {
+        // db を a のみが参照。a 停止時、db も連鎖停止(従来挙動)
+        let db = make_container("db", "db", "proj", vec![]);
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let chain = stop_chain(&a, &[db.clone(), a.clone()], 10);
+        let ids: Vec<_> = chain.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"a") && ids.contains(&"db"));
+    }
+
+    #[test]
+    fn test_stop_chain_shared_dependency_recursive() {
+        // a→b→db の連鎖で、db を c も共有。a 停止時、b は止まるが db は止めない
+        let db = make_container("db", "db", "proj", vec![]);
+        let b = make_container("b", "b", "proj", vec![dep("db", "service_started")]);
+        let a = make_container("a", "a", "proj", vec![dep("b", "service_started")]);
+        let c = make_container("c", "c", "proj", vec![dep("db", "service_started")]);
+        let chain = stop_chain(&a, &[db.clone(), b.clone(), a.clone(), c.clone()], 10);
+        let ids: Vec<_> = chain.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"a") && ids.contains(&"b"));
+        assert!(!ids.contains(&"db"), "共有依存 db は停止対象外のはず");
+        assert!(!ids.contains(&"c"), "停止対象外の c は含まれないはず");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_collects_when_all_inactive() {
+        // db を a と b が共有。両方アクティブでない → db は回収対象
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let b = make_container("b", "b", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone(), b.clone()];
+        let active = HashSet::new();
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        let ids: Vec<_> = out.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"db"));
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_keeps_when_referrer_active() {
+        // db を a と b が共有。b がアクティブ → db は回収対象外
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let b = make_container("b", "b", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone(), b.clone()];
+        let active = HashSet::from(["b".to_string()]);
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        assert!(out.is_empty(), "アクティブな参照元があるので回収しない");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_ignores_not_started_by_dormant() {
+        // db は dormant が起動していない(手動起動) → 回収対象外
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone()];
+        let active = HashSet::new();
+        let started = HashSet::new(); // dormant 起動記録なし
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        assert!(out.is_empty(), "dormant が起動していないので回収しない");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_ignores_not_running() {
+        // db は停止中 → 回収対象外
+        let db = make_container("db", "db", "proj", vec![]); // running=false
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone()];
+        let active = HashSet::new();
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        assert!(out.is_empty(), "停止中なので回収しない");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_ignores_no_referrers() {
+        // db を参照する子がいない → 回収対象外(単独起動の実サービスを守る)
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        let containers = vec![db.clone()];
+        let active = HashSet::new();
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        assert!(out.is_empty(), "参照元がいないので回収しない");
     }
 
     #[test]

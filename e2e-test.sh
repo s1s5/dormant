@@ -535,6 +535,104 @@ test_e21() {
     return 1
 }
 
+# E21b: 共有依存 (db) を app1/app2 が参照。app1 がアイドル停止しても
+#       app2 がまだ参照しているので db は連鎖停止されない
+test_e21b() {
+    docker run -d --name "$PREFIX-e21bdb" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label com.docker.compose.project=e2e21b \
+        --label com.docker.compose.service=db \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker run -d --name "$PREFIX-e21bapp1" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label com.docker.compose.project=e2e21b \
+        --label com.docker.compose.service=app1 \
+        --label com.docker.compose.depends_on=db:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker run -d --name "$PREFIX-e21bapp2" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label com.docker.compose.project=e2e21b \
+        --label com.docker.compose.service=app2 \
+        --label com.docker.compose.depends_on=db:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    # app1 と app2 を起動 (db も連鎖起動される)
+    wait_http "$PREFIX-e21bapp1" 200 15 || return 1
+    wait_http "$PREFIX-e21bapp2" 200 15 || return 1
+    container_running "$PREFIX-e21bdb" || return 1
+    # app1 へのアクセスを止めてアイドル停止を待つ
+    local deadline=$((SECONDS + 60))
+    while (( SECONDS < deadline )); do
+        if ! container_running "$PREFIX-e21bapp1"; then
+            # app1 は停止した。db は app2 が参照しているので残っているはず
+            if container_running "$PREFIX-e21bdb" && container_running "$PREFIX-e21bapp2"; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# E21c: 補助コンテナ(ポートなし)の回収。参照元の子が全部停止したら
+#       dormant が起動した補助コンテナも自動停止される
+test_e21c() {
+    # 補助コンテナ (awaken 相当): dormant.enable のみでポートなし
+    docker run -d --name "$PREFIX-e21chelper" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label com.docker.compose.project=e2e21c \
+        --label com.docker.compose.service=helper \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker run -d --name "$PREFIX-e21capp1" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label com.docker.compose.project=e2e21c \
+        --label com.docker.compose.service=app1 \
+        --label com.docker.compose.depends_on=helper:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker run -d --name "$PREFIX-e21capp2" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=80 \
+        --label dormant.startup.timeout=15s \
+        --label dormant.session-duration=10s \
+        --label com.docker.compose.project=e2e21c \
+        --label com.docker.compose.service=app2 \
+        --label com.docker.compose.depends_on=helper:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    # app1 と app2 を起動 (helper も連鎖起動される)
+    wait_http "$PREFIX-e21capp1" 200 15 || return 1
+    wait_http "$PREFIX-e21capp2" 200 15 || return 1
+    container_running "$PREFIX-e21chelper" || return 1
+    # app1, app2 へのアクセスを止めて両方アイドル停止を待つ
+    local deadline=$((SECONDS + 90))
+    while (( SECONDS < deadline )); do
+        if ! container_running "$PREFIX-e21capp1" && ! container_running "$PREFIX-e21capp2"; then
+            # 両方停止した。helper も参照カウント0で回収されているはず
+            if ! container_running "$PREFIX-e21chelper"; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # G. WebSocket (E22)
 # ---------------------------------------------------------------------------
@@ -1491,6 +1589,8 @@ main() {
     run_test "E19 依存先が存在しない場合も本体は起動 (200)" test_e19
     run_test "E20 停止時に依存先も連鎖停止" test_e20
     run_test "E21 管理対象外の依存は停止時も触らない" test_e21
+    run_test "E21b 共有依存は他が参照中なら連鎖停止しない" test_e21b
+    run_test "E21c 補助コンテナは参照元が全停止したら回収" test_e21c
     run_test "E22 WebSocket アップグレード転送 (簡易)" test_e22
     run_test "E23 コンテナrenameでルート追従 (新名200/旧名404)" test_e23
     run_test "E24 コンテナ削除でルートから消える (404)" test_e24
