@@ -26,33 +26,31 @@ cargo build --release
 # バイナリは target/release/dormant
 ```
 
-## 設定（dormant.yml）
+## 設定
 
-```yaml
-# 待ち受けアドレス
-listen: "0.0.0.0:80"
-# Docker ソケット
-docker_socket: "/var/run/docker.sock"
-# アイドルチェック間隔（秒）
-idle_check_interval_secs: 30
-```
+設定はコマンドライン引数と環境変数で行います。コマンドライン引数が優先され、未指定の場合は環境変数→既定値の順で解決されます。
 
-| 項目 | 既定値 | 説明 |
-|------|--------|------|
-| `listen` | `0.0.0.0:80` | HTTP 待ち受け |
-| `docker_socket` | `/var/run/docker.sock` | Docker ソケットのパス |
-| `idle_check_interval_secs` | `30` | アイドル判定の周期（秒） |
-
-設定ファイルのパスは `-c` / `--config` で指定します（既定 `dormant.yml`）。ファイルが無ければ既定値を使います。
+| 引数 | 環境変数 | 既定値 | 説明 |
+|------|----------|--------|------|
+| `--listen` | `DORMANT_LISTEN` | `0.0.0.0:80` | HTTP 待ち受け |
+| `--docker-socket` | `DORMANT_DOCKER_SOCKET` | `/var/run/docker.sock` | Docker ソケットのパス |
+| `--idle-check-interval-secs` | `DORMANT_IDLE_CHECK_INTERVAL_SECS` | `30` | アイドル判定の周期（秒） |
+| `--self-network` | `DORMANT_SELF_NETWORK` | (空) | 自身のネットワークエイリアスを付与するネットワーク名 |
 
 ## 使い方
 
 ```bash
 # 起動
-dormant -c dormant.yml
+dormant
+
+# 引数で指定
+dormant --listen 0.0.0.0:8080 --docker-socket /run/user/1000/docker.sock
+
+# 環境変数で指定
+DORMANT_LISTEN=0.0.0.0:8080 dormant
 
 # 環境変数 RUST_LOG でログレベル変更（例: debug）
-RUST_LOG=debug dormant -c dormant.yml
+RUST_LOG=debug dormant
 ```
 
 ### コンテナへのラベル付け

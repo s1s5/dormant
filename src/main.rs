@@ -15,12 +15,11 @@ mod testutil;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
-/// コマンドライン引数
+/// コマンドライン引数 (環境変数で上書き可)
 #[derive(Parser, Debug)]
 #[command(
     name = "dormant",
@@ -28,9 +27,20 @@ use tracing_subscriber::EnvFilter;
     about = "Docker scale-to-zero reverse proxy"
 )]
 struct Args {
-    /// 設定ファイルのパス
-    #[arg(short, long, default_value = "dormant.yml")]
-    config: PathBuf,
+    /// HTTP 待ち受けアドレス
+    #[arg(long, env = "DORMANT_LISTEN", default_value = "0.0.0.0:80")]
+    listen: String,
+    /// Docker ソケットのパス
+    #[arg(long, env = "DORMANT_DOCKER_SOCKET", default_value = "/var/run/docker.sock")]
+    docker_socket: String,
+    /// アイドル判定の周期（秒）
+    #[arg(
+        long,
+        env = "DORMANT_IDLE_CHECK_INTERVAL_SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64)
+    )]
+    idle_check_interval_secs: u64,
     /// dormant自身のネットワークエイリアスを付与するネットワーク名。
     /// 管理対象コンテナの dormant.host ラベルのホスト名を自身のエイリアスとして
     /// docker network connect --alias で動的に追加する。
@@ -49,7 +59,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = config::Config::load(&args.config)?;
+    let config = config::Config::from_args(&args);
     tracing::info!("dormant starting: listen={}", config.listen);
 
     // Dockerクライアント初期化

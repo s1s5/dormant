@@ -1,8 +1,6 @@
-//! 設定ファイルの解析とDockerラベル定数
+//! 設定とDockerラベル定数
 
-use anyhow::Result;
-use serde::Deserialize;
-use std::path::Path;
+use crate::Args;
 
 /// ラベルキー
 pub const LABEL_ENABLE: &str = "dormant.enable";
@@ -31,9 +29,8 @@ pub const MAX_DEPENDENCY_DEPTH: usize = 10;
 pub const DEFAULT_SESSION_DURATION: &str = "1h";
 pub const DEFAULT_STARTUP_TIMEOUT: &str = "3m";
 
-/// 設定ファイル(dormant.yml)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+/// 設定
+#[derive(Debug, Clone)]
 pub struct Config {
     /// 待ち受けポート
     pub listen: String,
@@ -54,15 +51,12 @@ impl Default for Config {
 }
 
 impl Config {
-    /// YAMLファイルから設定を読み込む。ファイルが無ければデフォルト
-    pub fn load(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let cfg: Config = serde_yaml::from_str(&content)?;
-            Ok(cfg)
-        } else {
-            tracing::warn!("config file not found: {:?}, using defaults", path);
-            Ok(Config::default())
+    /// clap引数(環境変数で上書き可)から設定を構築する
+    pub fn from_args(args: &Args) -> Self {
+        Self {
+            listen: args.listen.clone(),
+            docker_socket: args.docker_socket.clone(),
+            idle_check_interval_secs: args.idle_check_interval_secs,
         }
     }
 }
@@ -79,24 +73,16 @@ mod tests {
     }
 
     #[test]
-    fn test_load_config_from_yaml() {
-        let yaml = r#"
-listen: "0.0.0.0:8080"
-docker_socket: "/tmp/docker.sock"
-idle_check_interval_secs: 10
-"#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+    fn test_from_args() {
+        let args = Args {
+            listen: "0.0.0.0:8080".to_string(),
+            docker_socket: "/tmp/docker.sock".to_string(),
+            idle_check_interval_secs: 10,
+            self_network: String::new(),
+        };
+        let cfg = Config::from_args(&args);
         assert_eq!(cfg.listen, "0.0.0.0:8080");
         assert_eq!(cfg.docker_socket, "/tmp/docker.sock");
         assert_eq!(cfg.idle_check_interval_secs, 10);
-    }
-
-    #[test]
-    fn test_partial_config_defaults() {
-        // 一部だけ指定しても残りはデフォルト
-        let yaml = "listen: \"0.0.0.0:9999\"\n";
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.listen, "0.0.0.0:9999");
-        assert_eq!(cfg.docker_socket, "/var/run/docker.sock");
     }
 }

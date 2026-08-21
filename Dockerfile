@@ -26,11 +26,9 @@ FROM busybox AS dormant
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /dormant /dormant
-COPY dormant.yml /etc/dormant/dormant.yml
 
 USER 999
 ENTRYPOINT ["/dormant"]
-CMD ["-c", "/etc/dormant/dormant.yml"]
 
 ENV RUST_LOG=info
 
@@ -46,7 +44,6 @@ ENV RUST_LOG=info
 # FROM alpine:3.20
 # RUN apk add --no-cache ca-certificates
 # COPY --from=builder /app/target/release/dormant /usr/local/bin/dormant
-# COPY dormant.yml /etc/dormant/dormant.yml
 # EXPOSE 18000
-# ENTRYPOINT ["dormant", "-c", "/etc/dormant/dormant.yml"]
+# ENTRYPOINT ["dormant"]
 
