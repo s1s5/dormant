@@ -1404,6 +1404,44 @@ test_e39() {
     return 0
 }
 
+# E45: dormant.alias ラベル専用のネットワークエイリアス付与
+#      - dormant.host を使わず dormant.alias のみで、dormant 自身のエイリアスに付与される
+#      - HTTP ルーティング表には載らない(HTTP リクエストで 404 になる)
+test_e45() {
+    self_alias_active || return $?
+
+    local alias_host="e45-redis.example.localhost"
+    # TCP 専用コンテナ(dormant.host なし)で dormant.alias のみを指定
+    run_nginx_container "$PREFIX-e45" --label dormant.alias="$alias_host" || return 1
+
+    # 1. dormant 自身のエイリアスに付与されることを待つ
+    local deadline=$((SECONDS + 20))
+    local added=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$alias_host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added" -ne 1 ]; then
+        echo "    (FAIL) '$alias_host' がエイリアスに付与されませんでした (dormant.alias)"
+        return 1
+    fi
+
+    # 2. HTTP ルーティングには載らない(dormant.alias の値では HTTP 解決されない)
+    #    probe_code は 404(ルート未同期)をリトライし、404 以外が返った時点でそれを返す。
+    #    dormant.alias は HTTP ルーティング表に載らないため、常に 404 が期待される。
+    #    もし 200 等が返ればルーティングされてしまっている → FAIL。
+    local code
+    code=$(probe_code "$alias_host" 15)
+    if [ "$code" != "404" ]; then
+        echo "    (FAIL) dormant.alias の '$alias_host' が HTTP ルーティングされてしまいました (status=$code)"
+        return 1
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
@@ -1476,6 +1514,7 @@ main() {
     run_test "E42 複数NWでは指定NWのみに付与 (self-alias)" test_e42
     run_test "E43 再起動後も全ホスト再付与 (self-alias)" test_e43
     run_test "E44 再作成で新ホストに追従 (self-alias)" test_e44
+    run_test "E45 dormant.alias 専用でエイリアス付与+HTTP非ルーティング" test_e45
 
     # サマリ
     echo
