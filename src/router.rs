@@ -202,6 +202,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: Some("172.20.0.99".to_string()),
             running: false,
             created: None,
@@ -289,6 +290,21 @@ mod tests {
 
         assert!(router.resolve("app.example.com").await.is_some());
         assert!(router.resolve("api.example.com").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_alias_not_used_for_http_resolution() {
+        // dormant.alias は HTTP ルーティング表に載せない
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.routes = vec![route("app.example.com")];
+        c.aliases = vec!["myredis.local".to_string()];
+        router.update(vec![c]).await;
+
+        // dormant.host 由来は解決できる
+        assert!(router.resolve("app.example.com").await.is_some());
+        // dormant.alias の値では HTTP 解決されない
+        assert!(router.resolve("myredis.local").await.is_none());
     }
 
     #[tokio::test]

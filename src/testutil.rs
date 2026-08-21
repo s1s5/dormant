@@ -514,6 +514,7 @@ pub fn make_container(id: &str, group: Option<&str>) -> ManagedContainer {
         healthcheck_port: None,
         healthcheck_status: None,
         routes: Vec::new(),
+        aliases: Vec::new(),
         ip: None,
         running: false,
         created: None,

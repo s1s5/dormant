@@ -71,6 +71,9 @@ pub struct ManagedContainer {
     pub healthcheck_status: Option<Vec<u16>>,
     /// ルーティングエントリ(dormant.host ラベル由来、host[:port] のカンマ区切り)
     pub routes: Vec<Route>,
+    /// ネットワークエイリアス(dormant.alias ラベル由来、カンマ区切りのホスト名のみ)
+    /// HTTP ルーティングには使わない。dormant 自身のネットワークエイリアス付与のみに使う
+    pub aliases: Vec<String>,
     /// コンテナIP(ネットワーク解決用)
     pub ip: Option<String>,
     /// running状態か
@@ -535,14 +538,21 @@ pub async fn sync_self_aliases(
     Ok(())
 }
 
-/// 管理対象コンテナの dormant.host ホスト名を収集する(重複排除・ソート済み)
+/// 管理対象コンテナの dormant.host ホスト名と dormant.alias を収集する(重複排除・ソート済み)
 async fn collect_route_hosts(router: &Router) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut hosts = Vec::new();
     for c in router.containers().await {
+        // dormant.host ルート
         for r in &c.routes {
             if !r.host.is_empty() && seen.insert(r.host.clone()) {
                 hosts.push(r.host.clone());
+            }
+        }
+        // dormant.alias(ネットワークエイリアス専用)
+        for a in &c.aliases {
+            if !a.is_empty() && seen.insert(a.clone()) {
+                hosts.push(a.clone());
             }
         }
     }
@@ -641,6 +651,7 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         healthcheck_port,
         healthcheck_status,
         routes,
+        aliases: parse_aliases(labels.get(LABEL_ALIAS).map(|s| s.as_str()).unwrap_or("")),
         ip: None,
         running: c.state == Some(ContainerSummaryStateEnum::RUNNING),
         created: c.created,
@@ -693,6 +704,15 @@ fn parse_duration(v: Option<&str>, default: &str) -> Duration {
 /// 形式: `host` または `host:port` のカンマ区切り
 fn parse_routes(v: &str) -> Vec<Route> {
     v.split(',').filter_map(|s| parse_route(s.trim())).collect()
+}
+
+/// dormant.alias ラベルをパースする
+/// 形式: `host` のカンマ区切り(ホスト名のみ。ポート情報は扱わない)
+fn parse_aliases(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// 単一のルーティングエントリをパースする
@@ -960,6 +980,84 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_aliases() {
+        // ホスト名のみのカンマ区切り
+        assert_eq!(
+            parse_aliases("myredis.local, mydb.local"),
+            vec!["myredis.local".to_string(), "mydb.local".to_string()]
+        );
+        // 空要素は除外・trim
+        assert_eq!(
+            parse_aliases(" a.local ,, b.local "),
+            vec!["a.local".to_string(), "b.local".to_string()]
+        );
+        // 空入力は空
+        assert_eq!(parse_aliases(""), Vec::<String>::new());
+        assert_eq!(parse_aliases("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_parse_container_aliases() {
+        // dormant.alias は dormant.host とは独立にパースされる
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+        labels.insert(LABEL_HOST.to_string(), "app.example.com".to_string());
+        labels.insert(LABEL_ALIAS.to_string(), "myredis.local, mydb.local".to_string());
+        let c = ContainerSummary {
+            id: Some("abc123".to_string()),
+            names: Some(vec!["/test-1".to_string()]),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let m = parse_container(&c).unwrap();
+        // dormant.host は routes にのみ
+        assert_eq!(
+            m.routes,
+            vec![Route {
+                host: "app.example.com".to_string(),
+                port: None,
+            }]
+        );
+        // dormant.alias は aliases にのみ(HTTP ルーティングには載らない)
+        assert_eq!(
+            m.aliases,
+            vec!["myredis.local".to_string(), "mydb.local".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_route_hosts_includes_aliases() {
+        use crate::testutil::make_container;
+        // dormant.host ルート + dormant.alias の両方を収集し、重複排除・ソートされる
+        let mut c = make_container("app", None);
+        c.routes = vec![
+            Route {
+                host: "shared.example.com".to_string(),
+                port: None,
+            },
+            Route {
+                host: "app.example.com".to_string(),
+                port: None,
+            },
+        ];
+        c.aliases = vec![
+            "shared.example.com".to_string(),
+            "myredis.local".to_string(),
+        ];
+        let router = Router::new();
+        router.update(vec![c]).await;
+        let hosts = collect_route_hosts(&router).await;
+        assert_eq!(
+            hosts,
+            vec![
+                "app.example.com".to_string(),
+                "myredis.local".to_string(),
+                "shared.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_parse_container_depends_on() {
         let mut labels = HashMap::new();
         labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
@@ -1000,6 +1098,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -1019,6 +1118,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -1048,6 +1148,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -1067,6 +1168,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -1091,6 +1193,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: None,
             running: false,
             created: None,
@@ -1189,6 +1292,29 @@ mod tests {
         assert_eq!(calls[0].0, "global");
         assert_eq!(calls[0].1, "self");
         assert_eq!(calls[0].2, vec!["api.example.com", "app.example.com"]);
+    }
+
+    // dormant.alias のみのコンテナでも、そのホスト名がエイリアスとして付与される
+    #[tokio::test]
+    async fn test_sync_self_aliases_from_alias_label() {
+        use crate::testutil::{make_container, setup_mock_docker, MockContainer};
+
+        // TCP 専用コンテナ(dormant.host なし)で dormant.alias のみを指定
+        let mut c = make_container("redis", None);
+        c.routes = Vec::new(); // HTTP ルーティングなし
+        c.aliases = vec!["myredis.local".to_string()];
+        let router = Router::new();
+        router.update(vec![c]).await;
+
+        let self_c = MockContainer::new("self", "172.30.0.5", 80);
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        let calls = mock.connect_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, vec!["myredis.local"]);
     }
 
     // すでに全ホストが付与済みなら connect を呼ばない(冪等)

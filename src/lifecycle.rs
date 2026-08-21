@@ -575,6 +575,7 @@ mod tests {
             healthcheck_port: None,
             healthcheck_status: None,
             routes: Vec::new(),
+            aliases: Vec::new(),
             ip: Some("172.20.0.99".to_string()),
             running: false,
             created: None,

@@ -13,6 +13,9 @@ pub const LABEL_HEALTHCHECK_PATH: &str = "dormant.healthcheck.path";
 pub const LABEL_HEALTHCHECK_PORT: &str = "dormant.healthcheck.port";
 pub const LABEL_HEALTHCHECK_STATUS: &str = "dormant.healthcheck.status";
 pub const LABEL_HOST: &str = "dormant.host";
+/// ネットワークエイリアス専用ラベル。dormant 自身のネットワークエイリアスにのみ使い、
+/// HTTP ルーティング表には載せない。カンマ区切りで複数指定可(ホスト名のみ)
+pub const LABEL_ALIAS: &str = "dormant.alias";
 /// TCP転送ラベル。形式: `PORT` または `LISTEN_PORT:CONTAINER_PORT`
 pub const LABEL_TCP: &str = "dormant.tcp";
 
