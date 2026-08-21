@@ -1,6 +1,7 @@
 //! テスト用ユーティリティ: Docker Engine API を模した Unix ソケットサーバー
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,10 +31,14 @@ pub struct MockContainer {
     pub port: u16,
     /// 起動を失敗させる(start が 500 を返す)
     pub start_fails: bool,
+    /// ネットワーク接続を失敗させる(connect が 500 を返す。alias 競合などの再現用)
+    pub connect_fails: bool,
     /// Docker healthcheck の状態(None = healthcheckなし)
     pub health: Option<String>,
     /// 接続ネットワーク一覧 (ネットワーク名, IP)。空なら従来どおり単一ネットワーク
     pub networks: Vec<(String, String)>,
+    /// ネットワークごとのエイリアス (ネットワーク名, エイリアス一覧)
+    pub aliases: Vec<(String, Vec<String>)>,
 }
 
 impl MockContainer {
@@ -44,11 +49,16 @@ impl MockContainer {
             ip: ip.to_string(),
             port,
             start_fails: false,
+            connect_fails: false,
             health: None,
             networks: Vec::new(),
+            aliases: Vec::new(),
         }
     }
 }
+
+/// テストソケットパスの重複を防ぐためのカウンタ(並行テスト対策)
+static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// モック Docker Engine サーバーの状態
 #[derive(Clone)]
@@ -59,6 +69,10 @@ pub struct MockDocker {
 struct MockState {
     containers: Vec<MockContainer>,
     start_order: Vec<String>,
+    /// ネットワーク接続の呼び出し記録 (network, container_id, aliases)
+    connect_calls: Vec<(String, String, Vec<String>)>,
+    /// ネットワーク切断の呼び出し記録 (network, container_id)
+    disconnect_calls: Vec<(String, String)>,
 }
 
 impl MockDocker {
@@ -67,6 +81,8 @@ impl MockDocker {
             state: Arc::new(Mutex::new(MockState {
                 containers,
                 start_order: Vec::new(),
+                connect_calls: Vec::new(),
+                disconnect_calls: Vec::new(),
             })),
         }
     }
@@ -74,13 +90,15 @@ impl MockDocker {
     /// Unix ソケットでサーバーを起動し、ソケットパスを返す
     pub async fn serve(self) -> PathBuf {
         let dir = std::env::temp_dir();
+        let n = SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
-            "dormant-test-{}-{}.sock",
+            "dormant-test-{}-{}-{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            n
         ));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
@@ -125,6 +143,16 @@ impl MockDocker {
     pub fn start_order(&self) -> Vec<String> {
         self.state.lock().unwrap().start_order.clone()
     }
+
+    /// ネットワーク接続の呼び出し記録 (network, container_id, aliases)
+    pub fn connect_calls(&self) -> Vec<(String, String, Vec<String>)> {
+        self.state.lock().unwrap().connect_calls.clone()
+    }
+
+    /// ネットワーク切断の呼び出し記録 (network, container_id)
+    pub fn disconnect_calls(&self) -> Vec<(String, String)> {
+        self.state.lock().unwrap().disconnect_calls.clone()
+    }
 }
 
 /// テスト用バックエンド: 接続を受け付けるだけの TCP サーバー
@@ -137,7 +165,8 @@ pub async fn spawn_backend() -> String {
                 break;
             };
             tokio::spawn(async move {
-                let io = TokioIo::new(stream);                let svc = service_fn(move |_req: Request<Incoming>| async {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |_req: Request<Incoming>| async {
                     let mut resp = Response::new(Full::new(Bytes::from_static(b"ok")));
                     *resp.status_mut() = StatusCode::OK;
                     Ok::<_, std::io::Error>(resp)
@@ -227,9 +256,7 @@ pub async fn spawn_h2_backend() -> String {
 }
 
 /// モック Docker サーバーを立て、DockerClient と状態確認用 MockDocker を返す
-pub async fn setup_mock_docker(
-    containers: Vec<MockContainer>,
-) -> (DockerClient, MockDocker) {
+pub async fn setup_mock_docker(containers: Vec<MockContainer>) -> (DockerClient, MockDocker) {
     let mock = MockDocker::new(containers);
     let path = mock.clone().serve().await;
     let docker = DockerClient::new(path.to_str().unwrap()).unwrap();
@@ -323,15 +350,127 @@ async fn handle(
             let entries = c
                 .networks
                 .iter()
-                .map(|(name, nip)| format!("\"{}\":{{\"IPAddress\":\"{}\"}}", name, nip))
+                .map(|(name, nip)| {
+                    // そのネットワークに設定されたエイリアスも返す
+                    let aliases = c
+                        .aliases
+                        .iter()
+                        .find(|(an, _)| an == name)
+                        .map(|(_, a)| a)
+                        .filter(|a| !a.is_empty());
+                    match aliases {
+                        Some(a) => {
+                            let arr = a
+                                .iter()
+                                .map(|x| format!("\"{}\"", x))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "\"{}\":{{\"IPAddress\":\"{}\",\"Aliases\":[{}]}}",
+                                name, nip, arr
+                            )
+                        }
+                        None => format!("\"{}\":{{\"IPAddress\":\"{}\"}}", name, nip),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{{{}}}", entries)
         };
         return json_response(&format!(
-            "{{\"State\":{},\"NetworkSettings\":{{\"Networks\":{}}}}}",
-            state_json, networks_json
+            "{{\"Id\":\"{}\",\"State\":{},\"NetworkSettings\":{{\"Networks\":{}}}}}",
+            c.id, state_json, networks_json
         ));
+    }
+
+    // POST /networks/{name}/connect (docker network connect --alias ...)
+    if method == "POST" && path.starts_with("/networks/") && path.ends_with("/connect") {
+        let network = path
+            .strip_prefix("/networks/")
+            .unwrap()
+            .strip_suffix("/connect")
+            .unwrap()
+            .to_string();
+        // ボディ: {"Container":"...","EndpointConfig":{"Aliases":[...]}}
+        let body = read_body(req).await;
+        let container_id = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["Container"].as_str().map(|s| s.to_string()));
+        let aliases: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v["EndpointConfig"]["Aliases"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let Some(container_id) = container_id else {
+            return empty_response(StatusCode::BAD_REQUEST);
+        };
+        let mut st = state.lock().unwrap();
+        let Some(c) = st.containers.iter_mut().find(|c| c.id == container_id) else {
+            return empty_response(StatusCode::NOT_FOUND);
+        };
+        // alias 競合などの失敗を再現(呼び出し記録のみ残す)
+        if c.connect_fails {
+            st.connect_calls
+                .push((network, container_id, Vec::new()));
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        // 未接続扱いにするため、既に同じネットワークが networks に無い場合のみ接続
+        if !c.networks.iter().any(|(n, _)| n == &network) {
+            // ダミーIPを割り当て(実体は inspect 以外で使わない)
+            c.networks
+                .push((network.clone(), "172.30.0.99".to_string()));
+        }
+        // エイリアスをマージ(重複は除去)
+        if let Some((_, existing)) = c.aliases.iter_mut().find(|(n, _)| n == &network) {
+            for a in aliases {
+                if !existing.contains(&a) {
+                    existing.push(a);
+                }
+            }
+        } else {
+            c.aliases.push((network.clone(), aliases));
+        }
+        let connected_aliases = c
+            .aliases
+            .iter()
+            .find(|(n, _)| n == &network)
+            .map(|(_, a)| a.clone())
+            .unwrap_or_default();
+        // c の借用はここまで(NLL)なので、st を再度借用できる
+        st.connect_calls
+            .push((network, container_id, connected_aliases));
+        return empty_response(StatusCode::NO_CONTENT);
+    }
+
+    // POST /networks/{name}/disconnect (docker network disconnect)
+    if method == "POST" && path.starts_with("/networks/") && path.ends_with("/disconnect") {
+        let network = path
+            .strip_prefix("/networks/")
+            .unwrap()
+            .strip_suffix("/disconnect")
+            .unwrap()
+            .to_string();
+        // ボディ: {"Container":"...","Force":true}
+        let body = read_body(req).await;
+        let container_id = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["Container"].as_str().map(|s| s.to_string()));
+        let Some(container_id) = container_id else {
+            return empty_response(StatusCode::BAD_REQUEST);
+        };
+        let mut st = state.lock().unwrap();
+        // ネットワークからエイリアスを除去(disconnect 相当)
+        if let Some(c) = st.containers.iter_mut().find(|c| c.id == container_id) {
+            c.networks.retain(|(n, _)| n != &network);
+            c.aliases.retain(|(n, _)| n != &network);
+        }
+        st.disconnect_calls.push((network, container_id));
+        return empty_response(StatusCode::NO_CONTENT);
     }
 
     empty_response(StatusCode::NOT_FOUND)
@@ -344,6 +483,15 @@ fn json_response(body: &str) -> Result<Response<String>, std::io::Error> {
         hyper::header::HeaderValue::from_static("application/json"),
     );
     Ok(resp)
+}
+
+/// リクエストボディを文字列として読み切る
+async fn read_body(req: Request<Incoming>) -> String {
+    use http_body_util::BodyExt;
+    match req.into_body().collect().await {
+        Ok(collected) => String::from_utf8_lossy(&collected.to_bytes()).to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 fn empty_response(status: StatusCode) -> Result<Response<String>, std::io::Error> {

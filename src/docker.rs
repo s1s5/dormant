@@ -1,7 +1,9 @@
 //! Docker連携: ラベル収集、コンテナ起動/停止、イベント監視
 
 use anyhow::{anyhow, Result};
-use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, EventMessageTypeEnum, HealthStatusEnum};
+use bollard::models::{
+    ContainerSummary, ContainerSummaryStateEnum, EventMessageTypeEnum, HealthStatusEnum,
+};
 use bollard::query_parameters::{
     EventsOptions, InspectContainerOptions, ListContainersOptions, StartContainerOptions,
     StopContainerOptions,
@@ -89,6 +91,9 @@ pub struct DockerClient {
     docker: Docker,
     /// dormant 自身が接続しているネットワーク名(共有ネットワークのIP優先に使う)
     self_networks: Arc<RwLock<Option<HashSet<String>>>>,
+    /// テスト用: 自身のコンテナIDの上書き(/etc/hostname 解決の代わり)
+    #[cfg(test)]
+    self_id: Arc<RwLock<Option<String>>>,
 }
 
 impl DockerClient {
@@ -97,6 +102,8 @@ impl DockerClient {
         Ok(Self {
             docker,
             self_networks: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            self_id: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -132,10 +139,101 @@ impl DockerClient {
             .collect()
     }
 
+    /// 自身のコンテナIDを `/etc/hostname` から解決する
+    /// (テストでは set_self_id で直接設定した値を使う)
+    async fn resolve_self_id(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            if let Some(id) = self.self_id.read().await.as_ref() {
+                return Some(id.clone());
+            }
+        }
+        let hostname = std::fs::read_to_string("/etc/hostname").ok()?;
+        let hostname = hostname.trim().to_string();
+        let inspect = self
+            .docker
+            .inspect_container(&hostname, None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        // ID が無い場合はホスト名そのままをフォールバックとして使う
+        Some(inspect.id.unwrap_or(hostname))
+    }
+
+    /// 自身のコンテナ名を `/etc/hostname` から解決する
+    /// (sync_self_aliases で切断時に自身の名前エイリアスを保護するために使う)
+    async fn resolve_self_name(&self) -> Option<String> {
+        let hostname = std::fs::read_to_string("/etc/hostname").ok()?;
+        Some(hostname.trim().to_string())
+    }
+
+    /// コンテナをネットワークに接続し、エイリアスを付与する
+    /// (`docker network connect --alias <host> ... <network> <container>` 相当)
+    async fn connect_with_aliases(
+        &self,
+        network: &str,
+        id: &str,
+        aliases: &[String],
+    ) -> Result<()> {
+        self.docker
+            .connect_network(
+                network,
+                bollard::models::NetworkConnectRequest {
+                    container: id.to_string(),
+                    endpoint_config: Some(bollard::models::EndpointSettings {
+                        aliases: Some(aliases.to_vec()),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("connect self to network '{}' failed: {}", network, e))?;
+        Ok(())
+    }
+
+    /// コンテナをネットワークから切断する(エイリアスを付け直すために使う)
+    /// force: true で強制切断する
+    async fn disconnect_from_network(&self, network: &str, id: &str) -> Result<()> {
+        self.docker
+            .disconnect_network(
+                network,
+                bollard::models::NetworkDisconnectRequest {
+                    container: id.to_string(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("disconnect self from network '{}' failed: {}", network, e))?;
+        Ok(())
+    }
+
+    /// コンテナの指定ネットワーク上の現在のエイリアスを取得する
+    /// ネットワークに未接続なら Ok(None) を返す
+    async fn current_network_aliases(
+        &self,
+        id: &str,
+        network: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let inspect = self
+            .docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await?;
+        let mut networks = inspect.network_settings.and_then(|ns| ns.networks);
+        Ok(match networks.as_mut().and_then(|m| m.remove(network)) {
+            Some(endpoint) => Some(endpoint.aliases.unwrap_or_default()),
+            None => None,
+        })
+    }
+
     /// テスト用: dormant 自身のネットワーク名を直接設定する
     #[cfg(test)]
     pub async fn set_self_networks(&self, nets: HashSet<String>) {
         *self.self_networks.write().await = Some(nets);
+    }
+
+    /// テスト用: 自身のコンテナIDを直接設定する(/etc/hostname 解決の代わり)
+    #[cfg(test)]
+    pub async fn set_self_id(&self, id: Option<String>) {
+        *self.self_id.write().await = id;
     }
 
     /// 管理対象コンテナの一覧を取得
@@ -236,7 +334,8 @@ impl DockerClient {
     }
 
     /// Dockerイベントを監視し、ルーターを更新
-    pub async fn watch_events(&self, router: &Router) {
+    /// `self_network` が Some なら、ルート同期の後に dormant 自身のネットワークエイリアスも同期する
+    pub async fn watch_events(&self, router: &Router, self_network: Option<&str>) {
         let mut stream = self.docker.events(Some(EventsOptions {
             since: None,
             until: None,
@@ -253,10 +352,19 @@ impl DockerClient {
                     let action = event.action.as_deref().unwrap_or("");
                     tracing::debug!("docker event: type={} action={}", t, action);
 
-                    if matches!(action, "create" | "start" | "stop" | "destroy" | "die" | "rename")
-                    {
+                    if matches!(
+                        action,
+                        "create" | "start" | "stop" | "destroy" | "die" | "rename"
+                    ) {
                         if let Err(e) = sync_routes(self, router).await {
                             tracing::warn!("route sync failed: {}", e);
+                            continue;
+                        }
+                        // ルート同期後に自身のエイリアスも同期(対象ネットワーク指定時のみ)
+                        if let Some(network) = self_network {
+                            if let Err(e) = sync_self_aliases(self, router, network).await {
+                                tracing::warn!("self alias sync failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -277,10 +385,179 @@ pub async fn sync_routes(docker: &DockerClient, router: &Router) -> Result<()> {
     Ok(())
 }
 
+/// 管理対象コンテナの dormant.host ホスト名を、dormant 自身のネットワークエイリアスとして
+/// `docker network connect --alias` で付与する(冪等)。
+///
+/// - 自身のコンテナIDは `/etc/hostname` から解決(`resolve_self_networks` と同手法)
+/// - 対象ネットワークに未接続なら、未付与の全ホストをまとめて1回の connect で接続する
+/// - 接続済みだが一部ホストが未付与の場合、現在のエイリアス + 未付与ホストをマージし、
+///   disconnect → マージ済みエイリアスで connect して動的に追加する
+///   (bollard の connect_network は接続済みエンドポイントへの新規 alias 追加が効かないため)
+/// - connect が競合(他コンテナが alias を占有)などで失敗しても warn ログを出して続行する
+/// - エイリアス未指定のルートも `--alias` に使う(host:port 形式は host のみ)
+pub async fn sync_self_aliases(
+    docker: &DockerClient,
+    router: &Router,
+    network: &str,
+) -> Result<()> {
+    // 管理対象の dormant.host ホスト名を収集(空なら何もしない)
+    let hosts = collect_route_hosts(router).await;
+    if hosts.is_empty() {
+        tracing::debug!("self alias sync: no dormant.host routes, nothing to do");
+        return Ok(());
+    }
+
+    // 自身のコンテナIDを解決(未解決なら何もしない)
+    let self_id = match docker.resolve_self_id().await {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                "self alias sync: cannot resolve own container id (/etc/hostname), skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    // 自身の対象ネットワーク上の現在のエイリアスを取得(冪等性チェック用)
+    // 取得エラーは warn して安全側に抜ける
+    let attached = match docker.current_network_aliases(&self_id, network).await {
+        Ok(aliases) => aliases,
+        Err(e) => {
+            tracing::warn!("self alias sync: inspect self failed: {}", e);
+            return Ok(());
+        }
+    };
+
+    // すでに付与済みのホストを除いた未付与ホストを計算
+    let existing: HashSet<&str> = attached
+        .as_ref()
+        .map(|aliases| aliases.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    let missing: Vec<String> = hosts
+        .iter()
+        .filter(|h| !existing.contains(h.as_str()))
+        .cloned()
+        .collect();
+
+    // 未接続なら、未付与ホストをエイリアスとして1回の connect で接続する
+    // (missing が空 = 接続すべきホストが無いなら何もしない)
+    let Some(current) = attached else {
+        if missing.is_empty() {
+            tracing::debug!("self alias sync: not connected and no hosts to add");
+            return Ok(());
+        }
+        tracing::info!(
+            "connecting self to network '{}' with aliases: {}",
+            network,
+            missing.join(", ")
+        );
+        // 競合(他コンテナが alias を占有)を含む connect エラーは warn を出して続行する
+        if let Err(e) = docker.connect_with_aliases(network, &self_id, &missing).await {
+            tracing::warn!(
+                "self alias sync: connect to network '{}' with aliases [{}] failed: {}",
+                network,
+                missing.join(", "),
+                e
+            );
+        }
+        return Ok(());
+    };
+
+    // 接続済み: 現在エイリアスから余剰(管理対象ホストでも自身のコンテナ名でもない)を除去し、
+    // 未付与ホストを追加したマージを作る。変更がある場合のみ disconnect → connect で反映する
+    // (bollard の connect_network は接続済みエンドポイントへの新規 alias 追加/削除が効かないため、
+    //  disconnect→connect 方式を使う)
+    // 削除の検出: 現在エイリアスのうち、いずれにも該当しないもの(余剰)を除外する
+    //   - 管理対象の dormant.host ホスト
+    //   - dormant 自身のコンテナ名 / 短縮名(切断時に自分を失わないため保護)
+    let self_name = docker.resolve_self_name().await;
+    let mut merged: Vec<String> = current
+        .iter()
+        .filter(|a| {
+            if hosts.contains(*a) {
+                return true;
+            }
+            // 自身のコンテナ名(長・短両方)は保護
+            if let Some(n) = &self_name {
+                if a.as_str() == n || a.as_str() == n.split('.').next().unwrap_or(n.as_str()) {
+                    return true;
+                }
+            }
+            false
+        })
+        .cloned()
+        .collect();
+    // 未付与ホストを追加
+    for h in &missing {
+        if !merged.contains(h) {
+            merged.push(h.clone());
+        }
+    }
+    // 決定的な順序にするためソート
+    merged.sort();
+
+    // 現在エイリアス(ソート済み)との差分を判定し、変更が無ければ何もしない(冪等)
+    let mut current_sorted = current;
+    current_sorted.sort();
+    if merged == current_sorted {
+        tracing::info!(
+            "self aliases up to date on network '{}' ({} hosts)",
+            network,
+            hosts.len()
+        );
+        return Ok(());
+    }
+
+    tracing::info!(
+        "self aliases on network '{}': {} missing, {} current -> merged: {}",
+        network,
+        missing.len(),
+        current_sorted.len(),
+        merged.join(", ")
+    );
+    if let Err(e) = docker.disconnect_from_network(network, &self_id).await {
+        tracing::warn!(
+            "self alias sync: disconnect from network '{}' failed: {}",
+            network,
+            e
+        );
+        return Ok(());
+    }
+    // 競合(他コンテナが alias を占有)を含む connect エラーは warn を出して続行(握りつぶし)
+    if let Err(e) = docker.connect_with_aliases(network, &self_id, &merged).await {
+        tracing::warn!(
+            "self alias sync: connect to network '{}' with aliases [{}] failed: {}",
+            network,
+            merged.join(", "),
+            e
+        );
+    }
+    Ok(())
+}
+
+/// 管理対象コンテナの dormant.host ホスト名を収集する(重複排除・ソート済み)
+async fn collect_route_hosts(router: &Router) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut hosts = Vec::new();
+    for c in router.containers().await {
+        for r in &c.routes {
+            if !r.host.is_empty() && seen.insert(r.host.clone()) {
+                hosts.push(r.host.clone());
+            }
+        }
+    }
+    // コンテナ列挙順(HashMap)に依存しないようソートして返す
+    hosts.sort();
+    hosts
+}
+
 /// コンテナ情報から管理対象を判定・パース
 fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
     let labels = c.labels.as_ref()?;
-    let enabled = labels.get(LABEL_ENABLE).map(|v| v == "true").unwrap_or(false);
+    let enabled = labels
+        .get(LABEL_ENABLE)
+        .map(|v| v == "true")
+        .unwrap_or(false);
     if !enabled {
         return None;
     }
@@ -415,9 +692,7 @@ fn parse_duration(v: Option<&str>, default: &str) -> Duration {
 /// dormant.host ラベルをパースする
 /// 形式: `host` または `host:port` のカンマ区切り
 fn parse_routes(v: &str) -> Vec<Route> {
-    v.split(',')
-        .filter_map(|s| parse_route(s.trim()))
-        .collect()
+    v.split(',').filter_map(|s| parse_route(s.trim())).collect()
 }
 
 /// 単一のルーティングエントリをパースする
@@ -653,8 +928,14 @@ mod tests {
         let mut labels = HashMap::new();
         labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
         labels.insert("dormant.port".to_string(), "8080".to_string());
-        labels.insert(LABEL_HOST.to_string(), "app.example.com, api.example.com".to_string());
-        labels.insert(LABEL_HEALTHCHECK_STATUS.to_string(), "200,204,abc".to_string());
+        labels.insert(
+            LABEL_HOST.to_string(),
+            "app.example.com, api.example.com".to_string(),
+        );
+        labels.insert(
+            LABEL_HEALTHCHECK_STATUS.to_string(),
+            "200,204,abc".to_string(),
+        );
         let c = ContainerSummary {
             id: Some("abc123".to_string()),
             names: Some(vec!["/test-1".to_string()]),
@@ -861,8 +1142,185 @@ mod tests {
         // dormant 自身はどのネットワークにも接続していない(空)
         docker.set_self_networks(HashSet::new()).await;
 
-        // フォールバックで最初のネットワークのIPが返る
+        // フォールバックでいずれかのネットワークのIPが返る(HashMap の順序は非決定的)
         let ip = docker.resolve_ip("app").await.unwrap();
-        assert_eq!(ip, "172.21.0.2");
+        assert!(
+            ip == "172.21.0.2" || ip == "172.22.0.3",
+            "unexpected fallback IP: {}",
+            ip
+        );
+    }
+
+    // ---- 自身のネットワークエイリアス付与 (sync_self_aliases) ----
+
+    /// 指定ホスト名を dormant.host ルートに持つルーターを作る
+    async fn router_with_hosts(hosts: &[&str]) -> Router {
+        use crate::testutil::make_container;
+        let mut c = make_container("app", None);
+        c.routes = hosts
+            .iter()
+            .map(|h| Route {
+                host: h.to_string(),
+                port: None,
+            })
+            .collect();
+        let router = Router::new();
+        router.update(vec![c]).await;
+        router
+    }
+
+    // 未接続のネットワークに、未付与のホストがエイリアスとして1回の connect で付与される
+    #[tokio::test]
+    async fn test_sync_self_aliases_connects_with_missing_hosts() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        // 自身は対象ネットワーク(global)に未接続
+        let self_c = MockContainer::new("self", "172.30.0.5", 80);
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        let router = router_with_hosts(&["app.example.com", "api.example.com"]).await;
+
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        // connect が1回、両ホストのエイリアス付きで呼ばれる(ホストはソート順)
+        let calls = mock.connect_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "global");
+        assert_eq!(calls[0].1, "self");
+        assert_eq!(calls[0].2, vec!["api.example.com", "app.example.com"]);
+    }
+
+    // すでに全ホストが付与済みなら connect を呼ばない(冪等)
+    #[tokio::test]
+    async fn test_sync_self_aliases_idempotent() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let mut self_c = MockContainer::new("self", "172.30.0.5", 80);
+        self_c.networks = vec![("global".to_string(), "172.30.0.5".to_string())];
+        self_c.aliases = vec![(
+            "global".to_string(),
+            vec!["app.example.com".to_string(), "api.example.com".to_string()],
+        )];
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        let router = router_with_hosts(&["app.example.com", "api.example.com"]).await;
+
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        assert!(mock.connect_calls().is_empty());
+    }
+
+    // 接続済みで一部ホストが未付与の場合は、現在エイリアス + 未付与ホストをマージし、
+    // disconnect → connect で動的に追加される
+    #[tokio::test]
+    async fn test_sync_self_aliases_partial_reconnects_with_merged() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let mut self_c = MockContainer::new("self", "172.30.0.5", 80);
+        self_c.networks = vec![("global".to_string(), "172.30.0.5".to_string())];
+        self_c.aliases = vec![("global".to_string(), vec!["app.example.com".to_string()])];
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        let router = router_with_hosts(&["app.example.com", "api.example.com"]).await;
+
+        // エラーにせず、disconnect→connect(マージ済みエイリアス)で同期する
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        // 呼び出し順: 1. disconnect, 2. connect(マージ済み)
+        let disconnects = mock.disconnect_calls();
+        assert_eq!(disconnects.len(), 1);
+        assert_eq!(disconnects[0].0, "global");
+        assert_eq!(disconnects[0].1, "self");
+        let connects = mock.connect_calls();
+        assert_eq!(connects.len(), 1);
+        assert_eq!(connects[0].0, "global");
+        assert_eq!(connects[0].1, "self");
+        // 現在エイリアス + missing がマージされている(ソート順)
+        assert_eq!(connects[0].2, vec!["api.example.com", "app.example.com"]);
+    }
+
+    // 接続済みで未付与ホストがあるが connect が競合(他コンテナが alias 占有)で失敗する場合は
+    // warn を出して握りつぶし、エラーにはしない
+    #[tokio::test]
+    async fn test_sync_self_aliases_connect_conflict_swallowed() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let mut self_c = MockContainer::new("self", "172.30.0.5", 80);
+        self_c.networks = vec![("global".to_string(), "172.30.0.5".to_string())];
+        self_c.aliases = vec![("global".to_string(), vec!["app.example.com".to_string()])];
+        // connect を失敗させる(alias 競合の再現)
+        self_c.connect_fails = true;
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        let router = router_with_hosts(&["app.example.com", "api.example.com"]).await;
+
+        // エラーにはせず続行(warn ログで握りつぶし)
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        // disconnect は呼ばれ、connect は失敗したが1回試行されている
+        assert_eq!(mock.disconnect_calls().len(), 1);
+        assert_eq!(mock.connect_calls().len(), 1);
+    }
+
+    // 管理対象に dormant.host が無ければ何もしない
+    #[tokio::test]
+    async fn test_sync_self_aliases_no_routes() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let self_c = MockContainer::new("self", "172.30.0.5", 80);
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        docker.set_self_id(Some("self".to_string())).await;
+
+        let router = Router::new();
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        assert!(mock.connect_calls().is_empty());
+    }
+
+    // 自身のコンテナIDが解決できない場合は何もしない
+    #[tokio::test]
+    async fn test_sync_self_aliases_cannot_resolve_self() {
+        use crate::testutil::{setup_mock_docker, MockContainer};
+
+        let self_c = MockContainer::new("self", "172.30.0.5", 80);
+        let (docker, mock) = setup_mock_docker(vec![self_c]).await;
+        // self_id を設定しない → /etc/hostname 解決が失敗し何もしない
+
+        let router = router_with_hosts(&["app.example.com"]).await;
+        sync_self_aliases(&docker, &router, "global").await.unwrap();
+
+        assert!(mock.connect_calls().is_empty());
+    }
+
+    // ホスト名収集: 重複は排除され、dormant.host ルートのみが対象
+    #[tokio::test]
+    async fn test_collect_route_hosts_dedup() {
+        use crate::testutil::make_container;
+
+        let mut a = make_container("a", None);
+        a.routes = vec![
+            Route {
+                host: "app.example.com".to_string(),
+                port: None,
+            },
+            Route {
+                host: "shared.example.com".to_string(),
+                port: Some(8080),
+            },
+        ];
+        let mut b = make_container("b", None);
+        b.routes = vec![Route {
+            host: "shared.example.com".to_string(),
+            port: None,
+        }];
+        let router = Router::new();
+        router.update(vec![a, b]).await;
+
+        let hosts = collect_route_hosts(&router).await;
+        assert_eq!(hosts, vec!["app.example.com", "shared.example.com"]);
     }
 }

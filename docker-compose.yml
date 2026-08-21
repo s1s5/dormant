@@ -5,12 +5,13 @@ services:
       - cargo
       - watch
       - -s
-      - 'cargo run -- -c /etc/dormant/dormant.yml'
+      - 'cargo run --bin dormant -- -c /etc/dormant/dormant.yml'
     environment:
       HOME: "${HOME}"
       CARGO_HOME: "${HOME}/.cargo"
       RUSTUP_HOME: "/home/dev/.rustup"
       RUST_LOG: debug,h2=info,hyper=info,tower=info,bollard=error
+      DORMANT_SELF_NETWORK: "${DORMANT_SELF_NETWORK:-}"
     working_dir: ${PWD}
     volumes:
       - ${PWD}:${PWD}
@@ -24,7 +25,10 @@ services:
       - dormant
       - global
     ports:
-      - "${PORT:-18000}:80"
+      - "${PORT:-18000}:18000"
+      - "18101:18101"
+      - "18102:18102"
+      - "18103:18103"
 
 networks:
   dormant:

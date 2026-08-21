@@ -22,11 +22,21 @@ use tracing_subscriber::EnvFilter;
 
 /// コマンドライン引数
 #[derive(Parser, Debug)]
-#[command(name = "dormant", version, about = "Docker scale-to-zero reverse proxy")]
+#[command(
+    name = "dormant",
+    version,
+    about = "Docker scale-to-zero reverse proxy"
+)]
 struct Args {
     /// 設定ファイルのパス
     #[arg(short, long, default_value = "dormant.yml")]
     config: PathBuf,
+    /// dormant自身のネットワークエイリアスを付与するネットワーク名。
+    /// 管理対象コンテナの dormant.host ラベルのホスト名を自身のエイリアスとして
+    /// docker network connect --alias で動的に追加する。
+    /// 空なら無効(後方互換)。既定値は環境変数 DORMANT_SELF_NETWORK。
+    #[arg(long, env = "DORMANT_SELF_NETWORK", default_value = "")]
+    self_network: String,
 }
 
 #[tokio::main]
@@ -34,8 +44,7 @@ async fn main() -> Result<()> {
     // ログ初期化
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -51,14 +60,28 @@ async fn main() -> Result<()> {
     docker::sync_routes(&docker, &router).await?;
     tracing::info!("initial route sync done");
 
+    // 起動時: 管理対象のホスト名を自身のネットワークエイリアスとして付与(指定時のみ)
+    if !args.self_network.is_empty() {
+        if let Err(e) = docker::sync_self_aliases(&docker, &router, &args.self_network).await {
+            tracing::warn!("self alias sync failed: {}", e);
+        }
+    }
+
     // セッション管理(proxyのtouchとidle_loopのexpired判定で共有)
     let sessions = lifecycle::Sessions::new();
 
     // Dockerイベント監視タスク
     let docker_watch = docker.clone();
     let router_watch = router.clone();
+    let self_network = if args.self_network.is_empty() {
+        None
+    } else {
+        Some(args.self_network.clone())
+    };
     let event_task = tokio::spawn(async move {
-        docker_watch.watch_events(&router_watch).await;
+        docker_watch
+            .watch_events(&router_watch, self_network.as_deref())
+            .await;
     });
 
     // アイドル停止タスク

@@ -9,7 +9,7 @@
 # 実行:
 #   ./e2e-test.sh
 #
-# 検証パターン: E1 〜 E37 (plan-e2e-test.md, plan-e2e-ip-change.md 参照)
+# 検証パターン: E1 〜 E38 (plan-e2e-test.md, plan-e2e-ip-change.md, plan-e2e-self-alias.md 参照)
 #   各パターンを関数化し、pass/fail を判定して最後にサマリを表示する。
 #   テスト用コンテナはすべて <PREFIX>-* という名前で作成し、
 #   スクリプト終了時に trap 経由で必ず削除する。
@@ -24,6 +24,7 @@ DORMANT_CONTAINER="${DORMANT_CONTAINER:-dormant-dormant-1}"  # dormant 本体の
 
 PASS=0
 FAIL=0
+SKIP=0
 RESULTS=()
 
 # ---------------------------------------------------------------------------
@@ -160,18 +161,35 @@ PYEOF
     return $rc
 }
 
-# テスト実行ラッパー: 関数を実行して pass/fail を記録
+# テスト実行ラッパー: 関数を実行して pass/fail/skip を記録
+# 関数の戻り値: 0=pass / 1=fail / 2=skip (前提条件が満たされない場合)
+# 引数でフィルタ指定時($TEST_SELECT が空でなければ)は、テスト名に含まれる番号
+# (E<N>)が一致するものだけを実行する。
 run_test() { # name fn [args...]
     local name=$1
     shift
+    if [ -n "$TEST_SELECT" ]; then
+        local eid
+        eid=$(sed -n 's/^E\([0-9][0-9]*\).*/\1/p' <<<"$name")
+        if [ -z "$eid" ] || ! grep -qx "$eid" <<<"$TEST_SELECT"; then
+            return 0  # フィルタ対象外: 実行しない(結果には数えない)
+        fi
+    fi
     if "$@"; then
         PASS=$((PASS + 1))
         RESULTS+=("PASS: $name")
         echo "PASS: $name"
     else
-        FAIL=$((FAIL + 1))
-        RESULTS+=("FAIL: $name")
-        echo "FAIL: $name"
+        local rc=$?
+        if [ "$rc" -eq 2 ]; then
+            SKIP=$((SKIP + 1))
+            RESULTS+=("SKIP: $name")
+            echo "SKIP: $name"
+        else
+            FAIL=$((FAIL + 1))
+            RESULTS+=("FAIL: $name")
+            echo "FAIL: $name"
+        fi
     fi
 }
 
@@ -975,11 +993,434 @@ CONF
 }
 
 # ---------------------------------------------------------------------------
+# M. self-alias (E38)
+# ---------------------------------------------------------------------------
+
+# dormant が指定ネットワークに接続済みかどうか (self-alias 有効判定の材料)
+container_on_network() { # name network
+    docker inspect -f '{{if index .NetworkSettings.Networks "'"$2"'"}}yes{{else}}no{{end}}' "$1" 2>/dev/null
+}
+
+# コンテナの指定ネットワーク上のエイリアス一覧を取得 (未接続なら空)
+container_network_aliases() { # name network
+    docker inspect -f '{{with index .NetworkSettings.Networks "'"$2"'"}}{{range .Aliases}}{{println .}}{{end}}{{end}}' "$1" 2>/dev/null
+}
+
+# コンテナが接続しているネットワーク名一覧 (改行区切り)
+container_networks() { # name
+    docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{println}}{{end}}' "$1" 2>/dev/null
+}
+
+# コンテナのIPアドレスを取得 (dormant のIP解決に使う)
+container_ip() { # name [network]
+    if [ -n "${2:-}" ]; then
+        docker inspect -f '{{with index .NetworkSettings.Networks "'"$2"'"}}{{.IPAddress}}{{end}}' "$1" 2>/dev/null
+    else
+        docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{break}}{{end}}' "$1" 2>/dev/null
+    fi
+}
+
+# 既存の管理対象コンテナ (dormant.enable=true) が持つ dormant.host ホスト名を収集する
+# (host:port 形式はホスト名のみ抽出。dormant の self-alias はホスト名のみが付与される)
+managed_route_hosts() {
+    local ids
+    ids=$(docker ps -aq --filter "label=dormant.enable=true" 2>/dev/null) || return 0
+    local id
+    for id in $ids; do
+        local label
+        label=$(docker inspect -f '{{index .Config.Labels "dormant.host"}}' "$id" 2>/dev/null) || continue
+        [ -n "$label" ] || continue
+        printf '%s\n' "$label" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/:.*$//' | grep -v '^$'
+    done | sort -u
+}
+
+# E38: dormant.host 付きコンテナを追加起動すると、dormant 自身のネットワークエイリアスに
+#      ホスト名が動的に追加される
+# 検証: dormant が --self-network で起動されていれば、dormant.host 付きコンテナの create
+#       イベント後に sync_self_aliases が動き、dormant 自身のエイリアスにホスト名が付与される。
+#       docker inspect で付与を確認する。
+# 前提: dormant を --self-network なしで起動している環境では self-alias は無効のため
+#       SKIP 扱いにする (FAIL にしない)。有効判定は対象ネットワーク上の dormant の
+#       エイリアス状態から行う:
+#        1. dormant が対象ネットワークに接続されていること
+#        2. 既存 dormant.host ルートのエイリアスが dormant に付与済みであること
+#           (sync_self_aliases が実際に動いた証拠。--self-network なし起動では
+#            エイリアスが付与されないため、ここでスキップになる)
+test_e38() {
+    local host="e38.example.localhost"
+
+    # 1. dormant が対象ネットワークに接続されていなければ SKIP
+    if [ "$(container_on_network "$DORMANT_CONTAINER" "$NETWORK")" != "yes" ]; then
+        echo "    (SKIP) dormant がネットワーク '$NETWORK' に接続されていません"
+        echo "          (--self-network '$NETWORK' で起動していない可能性)"
+        return 2
+    fi
+
+    # 2. self-alias 有効判定: 既存 dormant.host のエイリアスが dormant に付与済みか
+    #    (付与されていなければ sync_self_aliases が動いていない = --self-network なし起動 → SKIP)
+    local aliases_now mhosts
+    aliases_now=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+    mhosts=$(managed_route_hosts)
+    local active=0
+    local mhost
+    while read -r mhost; do
+        [ -n "$mhost" ] || continue
+        if grep -qx "$mhost" <<<"$aliases_now"; then
+            active=1
+            break
+        fi
+    done <<<"$mhosts"
+    if [ "$active" -eq 0 ]; then
+        echo "    (SKIP) dormant のネットワーク '$NETWORK' 上のエイリアスに既存 dormant.host が付与されていません"
+        echo "          (dormant が --self-network なしで起動されているか、付与対象コンテナが存在しません)"
+        return 2
+    fi
+
+    # テスト用コンテナを dormant.host 付きで追加起動 (既存 $NETWORK 上)
+    run_nginx_container "$PREFIX-e38" --label dormant.host="$host" || return 1
+
+    # イベント検知 + disconnect→connect 反映を待つ (create イベント → sync_routes → sync_self_aliases)
+    local deadline=$((SECONDS + 20))
+    while (( SECONDS < deadline )); do
+        local aliases
+        aliases=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+        if grep -qx "$host" <<<"$aliases"; then
+            return 0  # dormant 自身のエイリアスにホスト名が追加された
+        fi
+        sleep 1
+    done
+
+    echo "    (INFO) dormant のエイリアス: $(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK" | tr '\n' ' ')"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# N. self-alias 追加テスト (E39-E44)
+# ---------------------------------------------------------------------------
+
+# 汎用: self-alias 有効かどうかを E38 と同様の2条件で判定 (無効なら SKIP=2)
+self_alias_active() { # → 0=有効 / 2=無効(返す) / 1=判定不能
+    # 1. dormant が対象ネットワークに接続されていなければ SKIP
+    if [ "$(container_on_network "$DORMANT_CONTAINER" "$NETWORK")" != "yes" ]; then
+        echo "    (SKIP) dormant がネットワーク '$NETWORK' に接続されていません"
+        echo "          (--self-network '$NETWORK' で起動していない可能性)"
+        return 2
+    fi
+    # 2. 既存 dormant.host のエイリアスが dormant に付与済みか
+    local aliases_now mhosts
+    aliases_now=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+    mhosts=$(managed_route_hosts)
+    local mhost
+    while read -r mhost; do
+        [ -n "$mhost" ] || continue
+        if grep -qx "$mhost" <<<"$aliases_now"; then
+            return 0
+        fi
+    done <<<"$mhosts"
+    echo "    (SKIP) dormant のネットワーク '$NETWORK' 上のエイリアスに既存 dormant.host が付与されていません"
+    echo "          (dormant が --self-network なしで起動されているか、付与対象コンテナが存在しません)"
+    return 2
+}
+
+# E42: dormant が複数ネットワークに参加していても、--self-network で指定したネットワークにのみ
+#      エイリアスが付与される (他のネットワークには付与されない)
+# 前提: dormant が $NETWORK と別のネットワーク($ALT_NETWORK)の両方に接続している必要がある。
+#       この環境では dormant は dormant と global の両方に接続している。
+test_e42() {
+    self_alias_active || return $?
+
+    # 別ネットワークとして "global" を使う(dormant が接続済みのネットワーク)
+    local alt="global"
+    if [ "$(container_on_network "$DORMANT_CONTAINER" "$alt")" != "yes" ]; then
+        echo "    (SKIP) dormant が代替ネットワーク '$alt' に接続されていません"
+        return 2
+    fi
+
+    local host="e42.example.localhost"
+    run_nginx_container "$PREFIX-e42" --label dormant.host="$host" || return 1
+
+    # $NETWORK(dormant) には付与され、$alt(global) には付与されないことを待つ
+    local deadline=$((SECONDS + 20))
+    local added_on_dormant=0 added_on_alt=0
+    while (( SECONDS < deadline )); do
+        local a_dormant a_alt
+        a_dormant=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+        a_alt=$(container_network_aliases "$DORMANT_CONTAINER" "$alt") || true
+        if grep -qx "$host" <<<"$a_dormant"; then
+            added_on_dormant=1
+        fi
+        if grep -qx "$host" <<<"$a_alt"; then
+            added_on_alt=1
+        fi
+        # 対象ネットワークに付与された時点で判定(alt には付与されないことを保証)
+        if [ "$added_on_dormant" -eq 1 ]; then
+            if [ "$added_on_alt" -eq 1 ]; then
+                break
+            fi
+            # 数秒の猶予を置いても alt に付与されなければ OK
+            sleep 3
+            a_alt=$(container_network_aliases "$DORMANT_CONTAINER" "$alt") || true
+            grep -qx "$host" <<<"$a_alt" && added_on_alt=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$added_on_dormant" -ne 1 ]; then
+        echo "    (FAIL) '$host' がネットワーク '$NETWORK' のエイリアスに付与されませんでした"
+        return 1
+    fi
+    if [ "$added_on_alt" -eq 1 ]; then
+        echo "    (FAIL) '$host' が指定外ネットワーク '$alt' のエイリアスにも付与されました"
+        return 1
+    fi
+    return 0
+}
+
+# E43: dormant を再起動しても、既存の管理対象ホストが全エイリアスへ再付与される (初期同期)
+test_e43() {
+    self_alias_active || return $?
+
+    local host="e43.example.localhost"
+    run_nginx_container "$PREFIX-e43" --label dormant.host="$host" || return 1
+
+    # 付与を待って確認
+    local deadline=$((SECONDS + 20))
+    local added=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added" -ne 1 ]; then
+        echo "    (FAIL) 再起動前の付与が確認できませんでした"
+        return 1
+    fi
+
+    # dormant を再起動 (healthz が落ちる/戻る)
+    docker restart "$DORMANT_CONTAINER" >/dev/null 2>&1 || return 1
+
+    # healthz が再び ok になるまで待つ
+    deadline=$((SECONDS + 60))
+    local hz=""
+    while (( SECONDS < deadline )); do
+        hz=$(curl -s -m 3 "$BASE_URL/healthz" 2>/dev/null) || hz=""
+        [ "$hz" = "ok" ] && break
+        sleep 2
+    done
+    if [ "$hz" != "ok" ]; then
+        echo "    (FAIL) dormant 再起動後、healthz が回復しませんでした"
+        return 1
+    fi
+
+    # 再起動後、初期同期でホストが再付与されることを待つ
+    deadline=$((SECONDS + 30))
+    local re_added=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            re_added=1
+            break
+        fi
+        sleep 2
+    done
+    if [ "$re_added" -ne 1 ]; then
+        echo "    (FAIL) 再起動後、ホスト '$host' がエイリアスに再付与されませんでした"
+        return 1
+    fi
+    return 0
+}
+
+# E40: 付与されたエイリアスが、同一ネットワーク上の別コンテナから dormant のIPに名前解決される
+test_e40() {
+    self_alias_active || return $?
+
+    local host="e40.example.localhost"
+    run_nginx_container "$PREFIX-e40" --label dormant.host="$host" || return 1
+
+    # dormant のIPを取得 (対象ネットワーク上)
+    local dormant_ip
+    dormant_ip=$(container_ip "$DORMANT_CONTAINER" "$NETWORK")
+    if [ -z "$dormant_ip" ]; then
+        echo "    (FAIL) dormant のIPを取得できませんでした"
+        return 1
+    fi
+
+    # 付与を待って確認
+    local deadline=$((SECONDS + 20))
+    local added=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added" -ne 1 ]; then
+        echo "    (FAIL) '$host' がエイリアスに付与されませんでした"
+        return 1
+    fi
+
+    # 第三コンテナ(alpine)から getent hosts で解決 → dormant_ip と一致するか
+    # (alpine には getent が含まれる。イメージ取得が無い場合は SKIP にする)
+    if ! docker image inspect alpine:latest >/dev/null 2>&1; then
+        echo "    (SKIP) alpine:latest イメージが無いため名前解決を確認できません"
+        return 2
+    fi
+    local resolved=""
+    deadline=$((SECONDS + 20))
+    while (( SECONDS < deadline )); do
+        resolved=$(docker run --rm --network "$NETWORK" alpine:latest getent hosts "$host" 2>/dev/null | awk '{print $1}')
+        if [ "$resolved" = "$dormant_ip" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "    (FAIL) '$host' が '$dormant_ip' に解決されませんでした (resolved='$resolved')"
+    return 1
+}
+
+# E41: dormant.host が host:port 形式でも、エイリアスにはホスト名のみ付与される (port は付かない)
+test_e41() {
+    self_alias_active || return $?
+
+    local host="e41.example.localhost"
+    local hostport="$host:8080"
+    run_nginx_container "$PREFIX-e41" --label dormant.host="$hostport" || return 1
+
+    # 付与を待って確認
+    local deadline=$((SECONDS + 20))
+    local added=0
+    while (( SECONDS < deadline )); do
+        local aliases
+        aliases=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+        if grep -qx "$host" <<<"$aliases"; then
+            added=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added" -ne 1 ]; then
+        echo "    (FAIL) '$host' がエイリアスに付与されませんでした"
+        return 1
+    fi
+
+    # host:port 全体の文字列がエイリアスに含まれていないこと
+    local aliases
+    aliases=$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK") || true
+    if grep -qx "$hostport" <<<"$aliases"; then
+        echo "    (FAIL) '$hostport' がエイリアスにそのまま付与されています (port が付いている)"
+        return 1
+    fi
+    return 0
+}
+
+# E44: 実行中のコンテナの dormant.host ラベルを変える(再作成)と、新ホストがエイリアスに追従する
+#      (ラベルは create 時にしか指定できないため、コンテナ再作成で検証する)
+test_e44() {
+    self_alias_active || return $?
+
+    local old_host="e44a.example.localhost"
+    local new_host="e44b.example.localhost"
+    run_nginx_container "$PREFIX-e44" --label dormant.host="$old_host" || return 1
+
+    # 旧ホスト付与を待つ
+    local deadline=$((SECONDS + 20))
+    local added_old=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$old_host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added_old=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added_old" -ne 1 ]; then
+        echo "    (FAIL) 旧ホスト '$old_host' がエイリアスに付与されませんでした"
+        return 1
+    fi
+
+    # 同名コンテナを再作成し、新ホストに変更 (E25 と同様の再作成パターン)
+    docker rm -f "$PREFIX-e44" >/dev/null 2>&1 || true
+    run_nginx_container "$PREFIX-e44" --label dormant.host="$new_host" || return 1
+
+    # 新ホストの付与を待つ
+    deadline=$((SECONDS + 20))
+    local added_new=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$new_host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added_new=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added_new" -ne 1 ]; then
+        echo "    (FAIL) 新ホスト '$new_host' がエイリアスに付与されませんでした"
+        return 1
+    fi
+    return 0
+}
+
+# E39: コンテナ削除で、dormant 自身のエイリアスからホストが除去される
+# 注意: この機能は sync_self_aliases の「余剰エイリアス除去」が必要。実装されていない場合は
+#       FAIL する(仕様検証用)。
+test_e39() {
+    self_alias_active || return $?
+
+    local host="e39.example.localhost"
+    run_nginx_container "$PREFIX-e39" --label dormant.host="$host" || return 1
+
+    # 付与を待って確認
+    local deadline=$((SECONDS + 20))
+    local added=0
+    while (( SECONDS < deadline )); do
+        if grep -qx "$host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            added=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$added" -ne 1 ]; then
+        echo "    (FAIL) '$host' がエイリアスに付与されませんでした"
+        return 1
+    fi
+
+    # コンテナを削除 → エイリアスから除去されることを待つ
+    docker rm -f "$PREFIX-e39" >/dev/null 2>&1 || return 1
+    deadline=$((SECONDS + 20))
+    local removed=0
+    while (( SECONDS < deadline )); do
+        if ! grep -qx "$host" <<<"$(container_network_aliases "$DORMANT_CONTAINER" "$NETWORK")"; then
+            removed=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$removed" -ne 1 ]; then
+        echo "    (FAIL) コンテナ削除後も '$host' がエイリアスに残っています"
+        echo "          (sync_self_aliases に余剰エイリアス除去が未実装の可能性)"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 main() {
     echo "=== dormant E2E テスト開始 ==="
     echo "対象: $BASE_URL  (dormant コンテナが起動していること)"
+    echo
+
+    # 引数指定: ./e2e-test.sh <E番号> で特定テストだけ実行
+    # 例: ./e2e-test.sh 38  (E38 のみ) / ./e2e-test.sh 25 27  (E25,E27)
+    TEST_SELECT=""
+    if [ "$#" -gt 0 ]; then
+        TEST_SELECT=$(printf '%s\n' "$@" | grep -oE '^[0-9]+$')
+        if [ -n "$TEST_SELECT" ]; then
+            echo "フィルタ: E番号 = $TEST_SELECT のみ実行"
+        fi
+    fi
     echo
 
     # 前提確認: dormant の /healthz
@@ -1028,13 +1469,20 @@ main() {
     run_test "E35 TCP 転送 (dormant.tcp 別ポート)" test_e35
     run_test "E36 TCP 接続中は停止しない" test_e36
     run_test "E37 複数ドメインで複数ポートを振り分け (200)" test_e37
+    run_test "E38 dormant.host を自身のエイリアスに動的追加 (self-alias)" test_e38
+    run_test "E39 コンテナ削除でエイリアスから除去 (self-alias)" test_e39
+    run_test "E40 エイリアスが同一NWの別コンテナから名前解決 (self-alias)" test_e40
+    run_test "E41 host:port ではホスト名のみ付与 (self-alias)" test_e41
+    run_test "E42 複数NWでは指定NWのみに付与 (self-alias)" test_e42
+    run_test "E43 再起動後も全ホスト再付与 (self-alias)" test_e43
+    run_test "E44 再作成で新ホストに追従 (self-alias)" test_e44
 
     # サマリ
     echo
     echo "=== サマリ ==="
     printf '%s\n' "${RESULTS[@]}"
     echo "----------------------------------------"
-    echo "PASS: $PASS / $((PASS + FAIL))   FAIL: $FAIL"
+    echo "PASS: $PASS / $((PASS + FAIL))   FAIL: $FAIL   SKIP: $SKIP"
     [ "$FAIL" -eq 0 ]
 }
 
