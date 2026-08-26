@@ -36,6 +36,36 @@ cargo build --release
 | `--docker-socket` | `DORMANT_DOCKER_SOCKET` | `/var/run/docker.sock` | Docker ソケットのパス |
 | `--idle-check-interval-secs` | `DORMANT_IDLE_CHECK_INTERVAL_SECS` | `30` | アイドル判定の周期（秒） |
 | `--self-network` | `DORMANT_SELF_NETWORK` | (空) | 自身のネットワークエイリアスを付与するネットワーク名 |
+| `--static-routes` | `DORMANT_STATIC_ROUTES` | (空) | 静的ルート（dormant が管理しない外部固定宛先）。`ホストパターン=IP:ポート` の並びをカンマまたは改行で区切る |
+
+### 静的ルート（外部固定宛先への直接転送）
+
+`DORMANT_STATIC_ROUTES` で、dormant が管理しない外部固定 IP:port への静的ルートを登録できます。
+ワイルドカードに対応しており、`*.example.com` は `foo.example.com` も `foo.bar.example.com` も、
+それより深い任意深度のサブドメインにもマッチします（ベースドメイン `example.com` 自体はマッチしません）。
+
+```bash
+# カンマ区切りで複数登録
+DORMANT_STATIC_ROUTES="*.example.com=203.0.113.10:8080,api.example.com=203.0.113.11:8443" dormant
+
+# 改行区切りも可能
+DORMANT_STATIC_ROUTES='*.example.com=203.0.113.10:8080
+api.example.com=203.0.113.11:8443' dormant
+```
+
+- 形式: `ホストパターン=IP:ポート`（区切りは `=`。`:` は IP:ポートの区切りに使うため）
+- 区切り: カンマ（`,`）と改行（`\n`）の両方を許容。空行・空要素は無視
+- パターン: `*.example.com`（ワイルドカード）または `api.example.com`（完全一致）
+- 転送先: dormant が管理しない外部固定 IP:port。dormant は起動・停止しない（起動待ち・セッション管理なしで直接転送）
+
+解決の優先順位は以下のとおりです。
+
+1. 動的完全一致（`dormant.host` ラベル / コンテナ名由来）
+2. 動的ラベル前方一致（既存の暗黙サブドメイン挙動）
+3. 静的完全一致（ワイルドカードなしの静的ルート）
+4. 静的ワイルドカード（`*.example.com`。複数マッチ時は最も長いサフィックス優先）
+
+静的ルートと動的ルート（`dormant.host` ラベル）が衝突する場合は warning ログを出し、動的ルートが優先されます。
 
 ## 使い方
 

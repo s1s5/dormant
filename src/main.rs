@@ -47,6 +47,12 @@ struct Args {
     /// 空なら無効(後方互換)。既定値は環境変数 DORMANT_SELF_NETWORK。
     #[arg(long, env = "DORMANT_SELF_NETWORK", default_value = "")]
     self_network: String,
+    /// 静的ルート(dormant が管理しない外部固定宛先)。
+    /// 形式: `ホストパターン=IP:ポート` の並びをカンマ(,)または改行で区切る。
+    /// ワイルドカード `*.example.com` は任意深度のサブドメインにマッチする。
+    /// 例: `*.example.com=203.0.113.10:8080,api.example.com=203.0.113.11:8443`
+    #[arg(long, env = "DORMANT_STATIC_ROUTES", default_value = "")]
+    static_routes: String,
 }
 
 #[tokio::main]
@@ -69,6 +75,12 @@ async fn main() -> Result<()> {
     let router = Arc::new(router::Router::new());
     docker::sync_routes(&docker, &router).await?;
     tracing::info!("initial route sync done");
+
+    // 静的ルート登録(DORMANT_STATIC_ROUTES。dormant が管理しない外部固定宛先)
+    if !config.static_routes.is_empty() {
+        router.set_static_routes(&config.static_routes).await;
+        tracing::info!("{} static route(s) registered", config.static_routes.len());
+    }
 
     // 起動時: 管理対象のホスト名を自身のネットワークエイリアスとして付与(指定時のみ)
     if !args.self_network.is_empty() {

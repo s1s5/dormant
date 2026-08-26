@@ -122,8 +122,8 @@ async fn handle(
     // Hostヘッダー → HTTP/2 :authority の順でホストを解決
     let host = resolve_host(&req);
 
-    // ホストから(コンテナ, 転送ポート)を解決
-    let (container, route_port) = match router.resolve(&host).await {
+    // ホストからルートを解決(動的コンテナ or 静的ルート)
+    let route = match router.resolve_with_static(&host).await {
         Some(r) => r,
         None => {
             tracing::warn!("no route for host: {}", host);
@@ -131,18 +131,35 @@ async fn handle(
         }
     };
 
-    // セッション記録(アクセスでタイマーリセット)
-    // 起動の成否に関わらずアクセス時点で記録し、次のアクセスまでセッションを維持する
-    sessions
-        .touch(&container.id, container.session_duration)
-        .await;
-
     // WebSocket判定
     let is_ws = req
         .headers()
         .get("upgrade")
         .map(|v| v.to_str().unwrap_or("").eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
+
+    // 静的ルート: dormant が管理しない外部固定宛先へ直接転送
+    // (起動待ち・セッション管理なし。dormant は起動・停止しない)
+    if let Some(target) = route.static_target() {
+        let target_addr = format!("{}:{}", target.ip, target.port);
+        tracing::debug!("static forward {} -> {}", host, target_addr);
+        if is_ws {
+            return handle_ws_static(req, ws_client, &target_addr).await;
+        }
+        return handle_http_static(req, client, h2_client, &target_addr).await;
+    }
+
+    // 動的ルート(dormant 管理対象コンテナ)
+    let (container, route_port) = match route {
+        crate::router::RouteResult::Dynamic(c, p) => (*c, p),
+        crate::router::RouteResult::Static(_) => unreachable!("static handled above"),
+    };
+
+    // セッション記録(アクセスでタイマーリセット)
+    // 起動の成否に関わらずアクセス時点で記録し、次のアクセスまでセッションを維持する
+    sessions
+        .touch(&container.id, container.session_duration)
+        .await;
 
     // グループ起動(G2: グループ内全コンテナを起動してから転送)
     if let Some(group) = &container.group {
@@ -275,6 +292,147 @@ async fn handle_http(
         Err(e) => {
             sessions.disconnect(&container.id).await;
             tracing::warn!("backend error for {}: {}", container.name, e);
+            Ok(error_response("backend error", StatusCode::BAD_GATEWAY))
+        }
+    }
+}
+
+/// 静的ルートへの通常HTTP/SSE転送(起動待ちなし・セッション管理なし)
+/// dormant が管理しない外部固定宛先へ直接転送する
+async fn handle_http_static(
+    req: Request<Incoming>,
+    client: ProxyClient,
+    h2_client: ProxyClient,
+    target_addr: &str,
+) -> Result<BoxResp, Infallible> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    let target = format!(
+        "http://{}/{}",
+        target_addr,
+        trim_leading_slash(path_and_query)
+    );
+    tracing::debug!("static forward -> {}", target);
+
+    let mut builder = Request::builder().method(req.method()).uri(&target);
+    // ヘッダーを転送(host は転送先アドレスに置き換わるため除外)
+    for (k, v) in req.headers() {
+        if k != hyper::header::HOST {
+            builder = builder.header(k, v);
+        }
+    }
+    let forwarded_req = builder.body(req.into_body()).unwrap();
+
+    // gRPC(C1)は HTTP/2 クライアント、それ以外は従来の HTTP/1.1 クライアント(C3)
+    let selected = if is_grpc(&forwarded_req) {
+        h2_client
+    } else {
+        client
+    };
+
+    match selected.request(forwarded_req).await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp
+                .into_body()
+                .map_err(std::io::Error::other)
+                .boxed();
+            let mut out = Response::new(body);
+            *out.status_mut() = status;
+            *out.headers_mut() = headers;
+            Ok(out)
+        }
+        Err(e) => {
+            tracing::warn!("static backend error for {}: {}", target_addr, e);
+            Ok(error_response("backend error", StatusCode::BAD_GATEWAY))
+        }
+    }
+}
+
+/// 静的ルートへのWebSocketブリッジ(起動待ちなし・セッション管理なし)
+async fn handle_ws_static(
+    mut req: Request<Incoming>,
+    ws_client: WsClient,
+    target_addr: &str,
+) -> Result<BoxResp, Infallible> {
+    // パスとヘッダーを先に取得
+    let path = req.uri().path().to_string();
+    let ws_key = req
+        .headers()
+        .get("sec-websocket-key")
+        .cloned()
+        .unwrap_or_else(|| hyper::header::HeaderValue::from_static(""));
+    let ws_version = req
+        .headers()
+        .get("sec-websocket-version")
+        .cloned()
+        .unwrap_or_else(|| hyper::header::HeaderValue::from_static("13"));
+
+    let client_upgraded_fut = hyper::upgrade::on(&mut req);
+
+    // バックエンドへアップグレードリクエスト(外部固定宛先へ直接)
+    let target = format!("http://{}/{}", target_addr, trim_leading_slash(&path));
+    let ws_req = Request::builder()
+        .method("GET")
+        .uri(&target)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", ws_key)
+        .header("sec-websocket-version", ws_version)
+        .body(Empty::new())
+        .unwrap();
+
+    match ws_client.request(ws_req).await {
+        Ok(resp) => {
+            if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                let backend_headers = resp.headers().clone();
+                let backend_upgraded = match hyper::upgrade::on(resp).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!("backend upgrade error: {}", e);
+                        return Ok(error_response("upgrade failed", StatusCode::BAD_GATEWAY));
+                    }
+                };
+
+                // クライアントに101を返す
+                let mut resp101 = Response::new(
+                    Empty::new()
+                        .map_err(std::io::Error::other)
+                        .boxed(),
+                );
+                *resp101.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                for (k, v) in &backend_headers {
+                    resp101.headers_mut().insert(k, v.clone());
+                }
+
+                tokio::spawn(async move {
+                    match client_upgraded_fut.await {
+                        Ok(client_upgraded) => {
+                            bridge_websocket(client_upgraded, backend_upgraded).await;
+                        }
+                        Err(e) => tracing::warn!("client upgrade error: {}", e),
+                    }
+                });
+
+                Ok(resp101)
+            } else {
+                let status = resp.status();
+                let body = resp
+                    .into_body()
+                    .map_err(std::io::Error::other)
+                    .boxed();
+                let mut out = Response::new(body);
+                *out.status_mut() = status;
+                Ok(out)
+            }
+        }
+        Err(e) => {
+            tracing::warn!("ws static backend request error: {}", e);
             Ok(error_response("backend error", StatusCode::BAD_GATEWAY))
         }
     }
@@ -517,6 +675,24 @@ mod tests {
         managed: Vec<crate::docker::ManagedContainer>,
     ) -> (String, testutil::MockDocker) {
         spawn_proxy_with_sessions(containers, managed, Sessions::new()).await
+    }
+
+    /// 静的ルート付きでプロキシサーバーを立てる
+    async fn spawn_proxy_with_static(
+        containers: Vec<MockContainer>,
+        managed: Vec<crate::docker::ManagedContainer>,
+        static_routes: Vec<crate::config::StaticRouteEntry>,
+    ) -> (String, testutil::MockDocker) {
+        let (docker, mock) = testutil::setup_mock_docker(containers).await;
+        let router = Arc::new(Router::new());
+        router.update(managed).await;
+        router.set_static_routes(&static_routes).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = serve_listener(listener, docker, router, Sessions::new()).await;
+        });
+        (addr, mock)
     }
 
     /// Sessions を外から注入できる版(アクティブ接続保護のテスト用)
@@ -834,5 +1010,118 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
         assert_eq!(resolve_host(&req), "foo.localhost");
+    }
+
+    // ---- 静的ルート(外部固定宛先へ直接転送) ----
+
+    /// テスト用 StaticRouteEntry
+    fn sre(pattern: &str, ip: &str, port: u16) -> crate::config::StaticRouteEntry {
+        crate::config::StaticRouteEntry {
+            pattern: pattern.to_string(),
+            ip: ip.to_string(),
+            port,
+        }
+    }
+
+    // S1: 静的完全一致ルートへのリクエストは起動待ちなしで直接転送される(200)
+    #[tokio::test]
+    async fn test_static_S1_exact_route_forwards_directly() {
+        // 静的宛先として使う実バックエンドを立てる
+        let addr = testutil::spawn_backend().await;
+        let (ip, port) = addr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        // 管理対象コンテナ(起動されるべきでない)
+        let mc = testutil::MockContainer::new("managed", "127.0.0.1", 1);
+        let c = testutil::make_container("managed", None);
+
+        let (proxy_addr, mock) = spawn_proxy_with_static(
+            vec![mc],
+            vec![c],
+            vec![sre("api.example.com", ip, port)],
+        )
+        .await;
+
+        let (status, body) = get(&proxy_addr, "api.example.com").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+        // 静的転送は起動待ちなし → 管理対象コンテナは起動されない
+        assert!(mock.start_order().is_empty());
+    }
+
+    // S2: 静的ワイルドカードルート(任意深度)へ直接転送される
+    #[tokio::test]
+    async fn test_static_S2_wildcard_route_forwards_directly() {
+        let addr = testutil::spawn_backend().await;
+        let (ip, port) = addr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        let (addr, _mock) = spawn_proxy_with_static(
+            vec![],
+            vec![],
+            vec![sre("*.example.com", ip, port)],
+        )
+        .await;
+
+        // 1段・多段の両方が直接転送される
+        let (status, body) = get(&addr, "foo.example.com").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "ok");
+        let (status, _) = get(&addr, "a.b.c.example.com").await;
+        assert_eq!(status, 200);
+        // ベースドメインは静的ルートにマッチしない → 404
+        let (status, _) = get(&addr, "example.com").await;
+        assert_eq!(status, 404);
+    }
+
+    // S3: 静的ルートと動的ルートが衝突する場合は動的(dormant.host)優先
+    #[tokio::test]
+    async fn test_static_S3_dynamic_wins_on_conflict() {
+        let (mc, c) = backend_container("web", None).await;
+        // 動的ルート web.localhost と、それを呑み込む静的ワイルドカードを同時に登録
+        let (addr, mock) = spawn_proxy_with_static(
+            vec![mc],
+            vec![c],
+            vec![sre("*.localhost", "127.0.0.1", 1)],
+        )
+        .await;
+
+        // web.localhost は動的コンテナに解決され起動して200
+        let (status, _) = get(&addr, "web.localhost").await;
+        assert_eq!(status, 200);
+        assert!(mock.is_running("web"));
+
+        // 動的ルートにないサブドメインは静的ワイルドカードへ(宛先1番ポートは閉じている → 502)
+        let (status, _) = get(&addr, "other.localhost").await;
+        assert_eq!(status, 502);
+    }
+
+    // S4: 静的完全一致は静的ワイルドカードより優先される
+    #[tokio::test]
+    async fn test_static_S4_exact_beats_wildcard() {
+        let addr1 = testutil::spawn_backend().await;
+        let (ip1, port1) = addr1.rsplit_once(':').unwrap();
+        let port1: u16 = port1.parse().unwrap();
+        // 完全一致側の宛先は閉じたポート(届けば502になる)
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (addr, _mock) = spawn_proxy_with_static(
+            vec![],
+            vec![],
+            vec![
+                sre("api.example.com", ip1, dead_port),
+                sre("*.example.com", ip1, port1),
+            ],
+        )
+        .await;
+
+        // 完全一致が勝つ → 宛先が閉じているので502
+        let (status, _) = get(&addr, "api.example.com").await;
+        assert_eq!(status, 502);
+        // それ以外はワイルドカード → 200
+        let (status, _) = get(&addr, "other.example.com").await;
+        assert_eq!(status, 200);
     }
 }

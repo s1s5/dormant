@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::config::StaticRouteEntry;
 use crate::docker::ManagedContainer;
 
 /// ルートキー(Host名)に対応する候補エントリ
@@ -22,6 +23,42 @@ impl RouteEntry {
     }
 }
 
+/// 静的ルートの転送先(dormant が管理しない外部固定宛先)
+#[derive(Debug, Clone)]
+pub struct StaticTarget {
+    pub ip: String,
+    pub port: u16,
+}
+
+/// 解決結果
+#[derive(Debug, Clone)]
+pub enum RouteResult {
+    /// 動的(dormant 管理対象コンテナ + 転送ポート)
+    /// コンテナは大きいため Box で包む(enum のサイズ差を小さく保つ)
+    Dynamic(Box<ManagedContainer>, u16),
+    /// 静的(dormant が管理しない外部固定宛先。起動待ち不要で直接転送)
+    Static(StaticTarget),
+}
+
+impl RouteResult {
+    /// 動的ルートのコンテナ(静的なら None)
+    #[cfg(test)]
+    pub fn container(&self) -> Option<&ManagedContainer> {
+        match self {
+            RouteResult::Dynamic(c, _) => Some(c),
+            RouteResult::Static(_) => None,
+        }
+    }
+
+    /// 静的ルートの転送先(動的なら None)
+    pub fn static_target(&self) -> Option<&StaticTarget> {
+        match self {
+            RouteResult::Static(t) => Some(t),
+            RouteResult::Dynamic(_, _) => None,
+        }
+    }
+}
+
 /// ルーティングテーブル
 /// key: Host名(例: "graphql.sb.carrot.localhost")
 /// value: そのホストの管理対象コンテナ候補リスト(転送ポート情報付き)
@@ -32,11 +69,112 @@ pub struct Router {
     /// key: dormant 側の待ち受けポート
     /// value: そのポートの管理対象コンテナ候補リスト
     tcp_listen: Arc<RwLock<HashMap<u16, Vec<ManagedContainer>>>>,
+    /// 静的ルート表(dormant が管理しない外部固定宛先)
+    static_routes: Arc<RwLock<StaticRoutes>>,
+}
+
+/// 静的ルート表
+/// 優先順位: 完全一致 → ワイルドカード(複数マッチ時は最も長いサフィックス優先)
+#[derive(Debug, Clone, Default)]
+pub struct StaticRoutes {
+    /// 完全一致ホスト(ワイルドカードなし)
+    pub exact: HashMap<String, StaticTarget>,
+    /// ワイルドカード(`*.example.com` → サフィックス `.example.com` で任意深度マッチ)
+    pub wildcard: Vec<(String, StaticTarget)>,
+}
+
+impl StaticRoutes {
+    /// 環境変数由来の静的ルート一覧から表を構築する
+    pub fn from_entries(entries: &[StaticRouteEntry]) -> Self {
+        let mut routes = StaticRoutes {
+            exact: HashMap::new(),
+            wildcard: Vec::new(),
+        };
+        for e in entries {
+            let target = StaticTarget {
+                ip: e.ip.clone(),
+                port: e.port,
+            };
+            if let Some(suffix) = e.pattern.strip_prefix("*.") {
+                if suffix.is_empty() || suffix.contains('*') {
+                    tracing::warn!(
+                        "invalid static route pattern '{}', skipping",
+                        e.pattern
+                    );
+                    continue;
+                }
+                routes.wildcard.push((suffix.to_string(), target));
+            } else if e.pattern.contains('*') {
+                tracing::warn!(
+                    "invalid static route pattern '{}', skipping",
+                    e.pattern
+                );
+            } else {
+                routes.exact.insert(e.pattern.clone(), target);
+            }
+        }
+        // 決定性のためサフィックスが長い順(最も長いサフィックスが先にマッチ)
+        routes
+            .wildcard
+            .sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+        routes
+    }
+
+    /// 静的ルートを解決する(完全一致 → ワイルドカードの順)
+    fn resolve(&self, host: &str) -> Option<StaticTarget> {
+        if let Some(t) = self.exact.get(host) {
+            return Some(t.clone());
+        }
+        // ワイルドカード: `*.example.com` → サフィックス `.example.com`
+        // `example.com` 自体はマッチしない。`foo.example.com` も `foo.bar.example.com` もマッチ
+        for (suffix, t) in &self.wildcard {
+            if host.ends_with(suffix.as_str()) && host.len() > suffix.len() {
+                return Some(t.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Router {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 静的ルート表を置き換える。
+    /// 動的(dormant.host ラベル由来)ホストとの衝突があれば warning を出す
+    /// (解決時は動的優先のため、静的ルートは動的ホストに負ける)
+    pub async fn set_static_routes(&self, entries: &[StaticRouteEntry]) {
+        let routes = StaticRoutes::from_entries(entries);
+        let map = self.inner.read().await;
+        // 衝突検出: 静的完全一致ホストと動的ホストの重複
+        for host in routes.exact.keys() {
+            if map.contains_key(host) {
+                tracing::warn!(
+                    "static route '{}' conflicts with dynamic route, dynamic wins",
+                    host
+                );
+            }
+        }
+        // ワイルドカードが動的ホストを呑み込む場合も warning(動的優先)
+        for (suffix, _) in &routes.wildcard {
+            for k in map.keys() {
+                if k.ends_with(suffix.as_str()) && k.len() > suffix.len() {
+                    tracing::warn!(
+                        "static wildcard '*{}' overlaps dynamic host '{}'; dynamic wins",
+                        suffix,
+                        k
+                    );
+                }
+            }
+        }
+        *self.static_routes.write().await = routes;
+    }
+
+    /// 静的ルート表へのアクセス(テスト用)
+    #[cfg(test)]
+    pub async fn static_routes(&self) -> StaticRoutes {
+        self.static_routes.read().await.clone()
     }
 
     /// ルーターを再構築
@@ -112,9 +250,37 @@ impl Router {
 
     /// Host名から解決済みルート(コンテナ + 転送ポート)を取得
     /// ポート未指定ルートはコンテナのデフォルトポートに解決する
+    ///
+    /// 優先順位: 動的完全一致 → 動的ラベル前方一致 → 静的完全一致 → 静的ワイルドカード
+    pub async fn resolve_with_static(&self, host: &str) -> Option<RouteResult> {
+        let map = self.inner.read().await;
+        // 1. 動的完全一致 → 2. 動的前方一致(サブドメイン)
+        if let Some(e) = map.get(host).and_then(|v| Self::pick(v)) {
+            let (c, p) = resolved_port(e);
+            return Some(RouteResult::Dynamic(Box::new(c), p));
+        }
+        // 前方一致: "foo.bar.localhost" に対する "bar.localhost"
+        if let Some(e) = map
+            .iter()
+            .find(|(k, _)| host.ends_with(k.as_str()) && host.len() > k.len())
+            .and_then(|(_, v)| Self::pick(v))
+        {
+            let (c, p) = resolved_port(e);
+            return Some(RouteResult::Dynamic(Box::new(c), p));
+        }
+        // 3. 静的完全一致 → 4. 静的ワイルドカード
+        self.static_routes
+            .read()
+            .await
+            .resolve(host)
+            .map(RouteResult::Static)
+    }
+
+    /// 従来の動的解決のみ(静的ルートを考慮しない)
+    /// テストからのみ使用(本番は resolve_with_static を使う)
+    #[cfg(test)]
     pub async fn resolve(&self, host: &str) -> Option<(ManagedContainer, u16)> {
         let map = self.inner.read().await;
-        // 完全一致 → 前方一致(サブドメイン)の順で探す
         if let Some(e) = map.get(host).and_then(|v| Self::pick(v)) {
             return Some(resolved_port(e));
         }
@@ -636,5 +802,192 @@ mod tests {
         let c = router.resolve_tcp(6334).await.unwrap();
         assert!(!c.is_running());
         assert_eq!(c.id, "id-/new-1");
+    }
+
+    // ---- 静的ルート(ワイルドカード対応) ----
+
+    /// テスト用 StaticRouteEntry
+    fn sre(pattern: &str, ip: &str, port: u16) -> crate::config::StaticRouteEntry {
+        crate::config::StaticRouteEntry {
+            pattern: pattern.to_string(),
+            ip: ip.to_string(),
+            port,
+        }
+    }
+
+    // ワイルドカード: 1段・多段・深いサブドメインすべてにマッチし、ベースドメイン自体はマッチしない
+    #[tokio::test]
+    async fn test_static_wildcard_matches_any_depth() {
+        let router = Router::new();
+        router
+            .set_static_routes(&[sre("*.example.com", "203.0.113.10", 8080)])
+            .await;
+
+        // 1段
+        let r = router.resolve_with_static("foo.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.10");
+        assert_eq!(t.port, 8080);
+
+        // 多段
+        let r = router.resolve_with_static("foo.bar.example.com").await.unwrap();
+        assert!(r.static_target().is_some());
+
+        // 深い
+        let r = router
+            .resolve_with_static("a.b.c.d.example.com")
+            .await
+            .unwrap();
+        assert!(r.static_target().is_some());
+
+        // ベースドメイン自体はマッチしない
+        assert!(router.resolve_with_static("example.com").await.is_none());
+        // 関係ないホストはマッチしない
+        assert!(router.resolve_with_static("other.org").await.is_none());
+        // サフィックス一致のみ(前方部分にexample.comを含んでもマッチしない)
+        assert!(router
+            .resolve_with_static("example.com.evil.org")
+            .await
+            .is_none());
+    }
+
+    // 静的完全一致は静的ワイルドカードより優先される
+    #[tokio::test]
+    async fn test_static_exact_beats_wildcard() {
+        let router = Router::new();
+        router
+            .set_static_routes(&[
+                sre("api.example.com", "203.0.113.11", 8443),
+                sre("*.example.com", "203.0.113.10", 8080),
+            ])
+            .await;
+
+        let r = router.resolve_with_static("api.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.11");
+        assert_eq!(t.port, 8443);
+
+        // 完全一致のないサブドメインはワイルドカード
+        let r = router.resolve_with_static("other.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.10");
+        assert_eq!(t.port, 8080);
+    }
+
+    // 複数ワイルドカードがマッチする場合は最も長いサフィックスが優先
+    #[tokio::test]
+    async fn test_static_wildcard_longest_suffix_wins() {
+        let router = Router::new();
+        router
+            .set_static_routes(&[
+                sre("*.example.com", "203.0.113.10", 8080),
+                sre("*.api.example.com", "203.0.113.20", 9000),
+            ])
+            .await;
+
+        // 両方にマッチするホスト → 長いサフィックス(.api.example.com)が勝つ
+        let r = router
+            .resolve_with_static("x.api.example.com")
+            .await
+            .unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.20");
+        assert_eq!(t.port, 9000);
+
+        // .api にマッチしないホスト → 短い方
+        let r = router.resolve_with_static("x.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.10");
+        assert_eq!(t.port, 8080);
+    }
+
+    // 衝突時は動的(dormant.host)優先。静的完全一致は動的完全一致に負ける
+    #[tokio::test]
+    async fn test_static_conflict_dynamic_exact_wins() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.routes = vec![route("app.example.com")];
+        router.update(vec![c]).await;
+        router
+            .set_static_routes(&[sre("app.example.com", "203.0.113.11", 8443)])
+            .await;
+
+        // 動的完全一致が勝つ
+        let r = router.resolve_with_static("app.example.com").await.unwrap();
+        let (c, port) = match r {
+            RouteResult::Dynamic(c, p) => (*c, p),
+            RouteResult::Static(_) => panic!("expected dynamic"),
+        };
+        assert_eq!(c.id, "id-/app-1");
+        assert_eq!(port, 8000);
+    }
+
+    // 衝突時: 動的ラベル前方一致も静的より優先される
+    #[tokio::test]
+    async fn test_static_conflict_dynamic_prefix_wins() {
+        let router = Router::new();
+        let mut c = make_container("/app-1", None);
+        c.routes = vec![route("bar.example.com")];
+        router.update(vec![c]).await;
+        router
+            .set_static_routes(&[sre("*.example.com", "203.0.113.10", 8080)])
+            .await;
+
+        // foo.bar.example.com は動的ラベル bar.example.com の前方一致 → 動的優先
+        let r = router
+            .resolve_with_static("foo.bar.example.com")
+            .await
+            .unwrap();
+        let c = r.container().unwrap();
+        assert_eq!(c.id, "id-/app-1");
+
+        // 動的ラベルに含まれないサブドメインは静的ワイルドカード
+        let r = router
+            .resolve_with_static("foo.other.example.com")
+            .await
+            .unwrap();
+        assert!(r.static_target().is_some());
+    }
+
+    // 動的解決にヒットしないホストは静的完全一致で解決される
+    #[tokio::test]
+    async fn test_static_exact_resolves() {
+        let router = Router::new();
+        router
+            .set_static_routes(&[sre("api.example.com", "203.0.113.11", 8443)])
+            .await;
+
+        let r = router.resolve_with_static("api.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.11");
+        assert_eq!(t.port, 8443);
+
+        // 完全一致にないホストは静的ルートでは解決されない
+        assert!(router.resolve_with_static("other.example.com").await.is_none());
+        // 従来の動的解決(静的考慮なし)では解決されない
+        assert!(router.resolve("api.example.com").await.is_none());
+    }
+
+    // 不正なパターン(`*` が先頭以外・`*.` のみ)はスキップされる
+    #[tokio::test]
+    async fn test_static_invalid_patterns_skipped() {
+        let router = Router::new();
+        router
+            .set_static_routes(&[
+                sre("a*b.example.com", "203.0.113.1", 80),
+                sre("*.", "203.0.113.2", 80),
+                sre("ok.example.com", "203.0.113.3", 80),
+            ])
+            .await;
+
+        // 不正パターンは表に入らず、正しいものだけ残る
+        let routes = router.static_routes().await;
+        assert_eq!(routes.exact.len(), 1);
+        assert!(routes.exact.contains_key("ok.example.com"));
+        assert!(routes.wildcard.is_empty());
+
+        let r = router.resolve_with_static("ok.example.com").await.unwrap();
+        let t = r.static_target().unwrap();
+        assert_eq!(t.ip, "203.0.113.3");
     }
 }
