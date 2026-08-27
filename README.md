@@ -26,6 +26,25 @@ cargo build --release
 # バイナリは target/release/dormant
 ```
 
+### Docker イメージのビルド（arm64 対応）
+
+Dockerfile は `rust:1-slim`（debian）と `debian:bookworm-slim` ベースのマルチステージビルドです。
+buildx を使うと amd64 / arm64 のマルチアーキテクチャイメージをビルドできます（QEMU エミュレーション）。
+
+```bash
+# 現在のプラットフォームのみ
+docker build -t dormant:latest .
+
+# amd64 + arm64 のマルチアーキテクチャビルド
+docker buildx build --platform linux/amd64,linux/arm64 -t dormant:latest .
+
+# レジストリへ push する場合（--push）
+docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/dormant:latest --push .
+```
+
+- 実行ステージは root で実行されます（rootless docker 環境向け）。非 root ユーザーは作成しません。
+- ビルドキャッシュには registry / git / target のみを使用します（secret や sccache は使用しません）。
+
 ## 設定
 
 設定はコマンドライン引数と環境変数で行います。コマンドライン引数が優先され、未指定の場合は環境変数→既定値の順で解決されます。
