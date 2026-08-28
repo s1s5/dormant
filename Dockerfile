@@ -1,6 +1,8 @@
 # ------------- build ----------------
 FROM rust:1-slim AS builder
 
+ARG TARGETARCH
+
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
@@ -8,7 +10,7 @@ COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+    --mount=type=cache,id=agent-gateway-target-$TARGETARCH,target=/app/target \
     cargo build --release --bin dormant && \
     cp ./target/release/dormant /dormant
 
