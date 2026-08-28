@@ -178,6 +178,36 @@ pub async fn spawn_backend() -> String {
     addr
 }
 
+/// テスト用バックエンド: 受信した Host ヘッダーを body として返すサーバー。
+/// 静的転送時に元の Host が維持されるか(下流プロキシのルーティングに使えるか)を検証する。
+pub async fn spawn_backend_echo_host() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| async move {
+                    let host = req
+                        .headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut resp = Response::new(Full::new(Bytes::from(host)));
+                    *resp.status_mut() = StatusCode::OK;
+                    Ok::<_, std::io::Error>(resp)
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+    addr
+}
+
 /// TCP エコーバックエンド: 受信データをそのまま返すサーバー
 pub async fn spawn_tcp_echo() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

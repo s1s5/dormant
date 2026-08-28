@@ -318,12 +318,20 @@ async fn handle_http_static(
     );
     tracing::debug!("static forward -> {}", target);
 
+    // 元の Host ヘッダーを保持する(転送先ホストのルーティングを維持するため)。
+    // 転送先アドレス(target_addr)で Host を上書きすると、下流のプロキシが
+    // 元のホスト名(例: *.duet3.localhost)でルーティングできず no route になる。
+    let orig_host = req.headers().get(hyper::header::HOST).cloned();
+
     let mut builder = Request::builder().method(req.method()).uri(&target);
-    // ヘッダーを転送(host は転送先アドレスに置き換わるため除外)
+    // ヘッダーを転送(Host は元の値を維持し、重複登録を避ける)
     for (k, v) in req.headers() {
         if k != hyper::header::HOST {
             builder = builder.header(k, v);
         }
+    }
+    if let Some(h) = orig_host {
+        builder = builder.header(hyper::header::HOST, h);
     }
     let forwarded_req = builder.body(req.into_body()).unwrap();
 
@@ -372,20 +380,24 @@ async fn handle_ws_static(
         .get("sec-websocket-version")
         .cloned()
         .unwrap_or_else(|| hyper::header::HeaderValue::from_static("13"));
+    // 元の Host ヘッダーを保持する(転送先ホストのルーティングを維持するため)
+    let orig_host = req.headers().get(hyper::header::HOST).cloned();
 
     let client_upgraded_fut = hyper::upgrade::on(&mut req);
 
     // バックエンドへアップグレードリクエスト(外部固定宛先へ直接)
     let target = format!("http://{}/{}", target_addr, trim_leading_slash(&path));
-    let ws_req = Request::builder()
+    let mut ws_req_builder = Request::builder()
         .method("GET")
         .uri(&target)
         .header("connection", "upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-key", ws_key)
-        .header("sec-websocket-version", ws_version)
-        .body(Empty::new())
-        .unwrap();
+        .header("sec-websocket-version", ws_version);
+    if let Some(h) = orig_host {
+        ws_req_builder = ws_req_builder.header(hyper::header::HOST, h);
+    }
+    let ws_req = ws_req_builder.body(Empty::new()).unwrap();
 
     match ws_client.request(ws_req).await {
         Ok(resp) => {
@@ -1072,6 +1084,29 @@ mod tests {
         // ベースドメインは静的ルートにマッチしない → 404
         let (status, _) = get(&addr, "example.com").await;
         assert_eq!(status, 404);
+    }
+
+    // S2b: 静的転送時に元の Host ヘッダーが維持される(下流プロキシのルーティングに使える)
+    // 修正前: 転送先アドレスで Host を上書きしており、下流の dormant が
+    // 元のホスト名(例: *.duet3.localhost)で解決できず no route になる問題があった。
+    #[tokio::test]
+    async fn test_static_S2b_forward_preserves_original_host() {
+        // Host ヘッダーを body として返すバックエンド
+        let addr = testutil::spawn_backend_echo_host().await;
+        let (ip, port) = addr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        let (addr, _mock) = spawn_proxy_with_static(
+            vec![],
+            vec![],
+            vec![sre("*.duet3.localhost", ip, port)],
+        )
+        .await;
+
+        // 元の Host がそのままバックエンドへ届くこと
+        let (status, body) = get(&addr, "agent-gateway.duet3.localhost").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "agent-gateway.duet3.localhost");
     }
 
     // S3: 静的ルートと動的ルートが衝突する場合は動的(dormant.host)優先
