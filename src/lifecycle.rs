@@ -118,9 +118,13 @@ pub async fn idle_loop(
         sleep(Duration::from_secs(interval_secs)).await;
         let expired = sessions.expired().await;
         for id in expired {
-            tracing::info!("session expired, stopping container {}", id);
             let containers = router.containers().await;
             match containers.iter().find(|c| c.id == id) {
+                Some(c) if c.always_on => {
+                    // 常時ONコンテナはアイドル停止しない(セッションは除去して再判定を防ぐ)
+                    tracing::debug!("always-on container {} skipped from idle stop", id);
+                    sessions.remove(&id).await;
+                }
                 Some(c) => {
                     // D3: 依存先(管理対象)を連鎖停止
                     for c in stop_chain(c, &containers, MAX_DEPENDENCY_DEPTH) {
@@ -128,14 +132,15 @@ pub async fn idle_loop(
                             tracing::warn!("failed to stop {}: {}", c.id, e);
                         }
                     }
+                    sessions.remove(&id).await;
                 }
                 None => {
                     if let Err(e) = docker.stop(&id).await {
                         tracing::warn!("failed to stop {}: {}", id, e);
                     }
+                    sessions.remove(&id).await;
                 }
             }
-            sessions.remove(&id).await;
         }
 
         // 参照カウント0の回収: dormant が起動した補助コンテナで、
@@ -208,6 +213,7 @@ pub async fn zero_ref_containers(
     containers
         .iter()
         .filter(|c| c.is_running())
+        .filter(|c| !c.always_on) // 常時ONコンテナは回収対象外
         .filter(|c| started_by_dormant.contains(&c.id))
         .filter(|c| {
             // このコンテナを depends_on で参照する子(参照元)
@@ -664,6 +670,7 @@ mod tests {
             depends_on,
             compose_project: Some(project.to_string()),
             compose_service: Some(service.to_string()),
+            always_on: false,
         }
     }
 
@@ -860,6 +867,88 @@ mod tests {
         let started = HashSet::from(["db".to_string()]);
         let out = zero_ref_containers(&containers, &active, &started).await;
         assert!(out.is_empty(), "参照元がいないので回収しない");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_ignores_always_on() {
+        // always_on コンテナは参照カウント0でも回収しない
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        db.always_on = true;
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone()];
+        let active = HashSet::new();
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        assert!(out.is_empty(), "always_on コンテナは回収しない");
+    }
+
+    #[tokio::test]
+    async fn test_zero_ref_containers_collects_non_always_on() {
+        // always_on 未指定(false)は従来どおり回収される
+        let mut db = make_container("db", "db", "proj", vec![]);
+        db.running = true;
+        db.always_on = false;
+        let a = make_container("a", "a", "proj", vec![dep("db", "service_started")]);
+        let containers = vec![db.clone(), a.clone()];
+        let active = HashSet::new();
+        let started = HashSet::from(["db".to_string()]);
+        let out = zero_ref_containers(&containers, &active, &started).await;
+        let ids: Vec<_> = out.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"db"), "always_on 未指定は回収される");
+    }
+
+    #[tokio::test]
+    async fn test_idle_loop_skips_always_on_container() {
+        // always_on コンテナは expired 判定でも停止されない
+        let (ip, port) = backend().await;
+        let mut mc = MockContainer::new("web", &ip, port);
+        mc.running = true;
+        let (docker, mock) = mock(vec![mc]).await;
+        let mut c = managed("web", None, port, Duration::from_secs(3));
+        c.running = true;
+        c.always_on = true;
+        let router = Router::new();
+        router.update(vec![c]).await;
+        let sessions = Sessions::new();
+        // 即 expired するセッション(duration=0)
+        sessions.touch("web", Duration::ZERO).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!sessions.expired().await.is_empty(), "前提: expired に出る");
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            idle_loop(&docker, &router, sessions, 0),
+        )
+        .await;
+
+        assert!(mock.is_running("web"), "always_on コンテナは停止されない");
+    }
+
+    #[tokio::test]
+    async fn test_idle_loop_stops_expired_non_always_on() {
+        // always_on 未指定(false)は expired で従来どおり停止される
+        let (ip, port) = backend().await;
+        let mut mc = MockContainer::new("web", &ip, port);
+        mc.running = true;
+        let (docker, mock) = mock(vec![mc]).await;
+        let mut c = managed("web", None, port, Duration::from_secs(3));
+        c.running = true;
+        c.always_on = false;
+        let router = Router::new();
+        router.update(vec![c]).await;
+        let sessions = Sessions::new();
+        sessions.touch("web", Duration::ZERO).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!sessions.expired().await.is_empty(), "前提: expired に出る");
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            idle_loop(&docker, &router, sessions, 0),
+        )
+        .await;
+
+        assert!(!mock.is_running("web"), "always_on 未指定は停止される");
     }
 
     #[test]

@@ -86,6 +86,8 @@ pub struct ManagedContainer {
     pub compose_project: Option<String>,
     /// compose サービス名(依存解決用)
     pub compose_service: Option<String>,
+    /// 常時ON(dormant.always-on=true)。アイドル停止・補助回収の対象外
+    pub always_on: bool,
 }
 
 /// Dockerクライアントのラッパー
@@ -654,6 +656,12 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         .map(|v| parse_tcp_exposes(v))
         .unwrap_or_default();
 
+    // dormant.always-on ラベル: `true` で常時ON(アイドル停止・補助回収の対象外)
+    let always_on = labels
+        .get(LABEL_ALWAYS_ON)
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     Some(ManagedContainer {
         id,
         name,
@@ -673,6 +681,7 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         depends_on,
         compose_project: labels.get(LABEL_COMPOSE_PROJECT).cloned(),
         compose_service: labels.get(LABEL_COMPOSE_SERVICE).cloned(),
+        always_on,
     })
 }
 
@@ -995,6 +1004,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_container_always_on() {
+        // dormant.always-on=true → always_on=true
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+        labels.insert(LABEL_ALWAYS_ON.to_string(), "true".to_string());
+        let c = ContainerSummary {
+            id: Some("abc123".to_string()),
+            names: Some(vec!["/test-1".to_string()]),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let m = parse_container(&c).unwrap();
+        assert!(m.always_on, "always-on=true で always_on が立つ");
+
+        // 未指定 → false
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+        let c = ContainerSummary {
+            id: Some("abc123".to_string()),
+            names: Some(vec!["/test-1".to_string()]),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let m = parse_container(&c).unwrap();
+        assert!(!m.always_on, "未指定は false");
+
+        // true 以外(例: "1") → false
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+        labels.insert(LABEL_ALWAYS_ON.to_string(), "1".to_string());
+        let c = ContainerSummary {
+            id: Some("abc123".to_string()),
+            names: Some(vec!["/test-1".to_string()]),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let m = parse_container(&c).unwrap();
+        assert!(!m.always_on, "true 以外は false");
+    }
+
+    #[test]
     fn test_parse_aliases() {
         // ホスト名のみのカンマ区切り
         assert_eq!(
@@ -1120,6 +1170,7 @@ mod tests {
             depends_on: Vec::new(),
             compose_project: Some("proj".to_string()),
             compose_service: Some("db".to_string()),
+            always_on: false,
         };
         let app = ManagedContainer {
             id: "id-app".to_string(),
@@ -1150,6 +1201,7 @@ mod tests {
             ],
             compose_project: Some("proj".to_string()),
             compose_service: Some("app".to_string()),
+            always_on: false,
         };
         let other = ManagedContainer {
             id: "id-other".to_string(),
@@ -1170,6 +1222,7 @@ mod tests {
             depends_on: Vec::new(),
             compose_project: Some("other-proj".to_string()),
             compose_service: Some("db".to_string()),
+            always_on: false,
         };
         let cache = ManagedContainer {
             id: "id-cache".to_string(),
@@ -1190,6 +1243,7 @@ mod tests {
             depends_on: Vec::new(),
             compose_project: Some("proj".to_string()),
             compose_service: Some("cache".to_string()),
+            always_on: false,
         };
         let resolved = app.resolve_dependencies(&[dep.clone(), other, cache]);
         assert_eq!(resolved.len(), 2);
@@ -1218,6 +1272,7 @@ mod tests {
             }],
             compose_project: Some("proj".to_string()),
             compose_service: Some("app2".to_string()),
+            always_on: false,
         };
         assert!(missing.resolve_dependencies(&[dep]).is_empty());
     }

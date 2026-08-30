@@ -16,6 +16,8 @@ pub const LABEL_HOST: &str = "dormant.host";
 pub const LABEL_ALIAS: &str = "dormant.alias";
 /// TCP転送ラベル。形式: `PORT` または `LISTEN_PORT:CONTAINER_PORT`
 pub const LABEL_TCP: &str = "dormant.tcp";
+/// 常時ONラベル。`true` でアイドル停止・補助コンテナ回収の対象外にする
+pub const LABEL_ALWAYS_ON: &str = "dormant.always-on";
 
 /// compose が付与するラベル
 pub const LABEL_COMPOSE_DEPENDS_ON: &str = "com.docker.compose.depends_on";

@@ -551,6 +551,7 @@ pub fn make_container(id: &str, group: Option<&str>) -> ManagedContainer {
         depends_on: Vec::new(),
         compose_project: None,
         compose_service: None,
+        always_on: false,
     }
 }
 
