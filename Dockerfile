@@ -20,23 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && \
     ln -s /opt/zig/zig /usr/local/bin/zig
 
-# 依存クレートのキャッシュを効かせるため、先に Cargo.toml / Cargo.lock だけコピーして
-# 依存クレートのビルドを一度通す（ソース変更時は依存の再コンパイルを避ける）
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    mkdir -p src && echo "fn main() {}" > src/main.rs && \
-    cargo zigbuild --release \
-        --target x86_64-unknown-linux-gnu \
-        --target aarch64-unknown-linux-gnu
-
-# 実ソースをコピーしてビルド（COPY は mtime を保持するため、
-# cargo が「変更なし」と誤判定しないよう touch で mtime を更新する）
 COPY src ./src
-RUN --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    touch src/*.rs && \
+RUN --mount=type=cache,id=dormant-target-$TARGETARCH,target=/app/target \
+    --mount=type=cache,id=dormant-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=dormant-cargo-git-$TARGETARCH,target=/usr/local/cargo/git \
     cargo zigbuild --release --bin dormant \
         --target x86_64-unknown-linux-gnu \
         --target aarch64-unknown-linux-gnu && \
