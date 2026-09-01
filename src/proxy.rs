@@ -476,30 +476,21 @@ async fn handle_ws(
 
     // パスとヘッダーを先に取得
     let path = req.uri().path().to_string();
-    let ws_key = req
-        .headers()
-        .get("sec-websocket-key")
-        .cloned()
-        .unwrap_or_else(|| hyper::header::HeaderValue::from_static(""));
-    let ws_version = req
-        .headers()
-        .get("sec-websocket-version")
-        .cloned()
-        .unwrap_or_else(|| hyper::header::HeaderValue::from_static("13"));
 
     let client_upgraded_fut = hyper::upgrade::on(&mut req);
 
     // バックエンドへアップグレードリクエスト(コンテナIP直アクセス)
+    // クライアントのヘッダーを全て転送する(host は転送先アドレスに置き換わるため除外)。
+    // connection/upgrade/sec-websocket-key/version もクライアントから来るのでそのまま渡り、
+    // sec-websocket-protocol 等の拡張ヘッダーも正しく転送される。
     let target = format!("http://{}/{}", target_addr, trim_leading_slash(&path));
-    let ws_req = Request::builder()
-        .method("GET")
-        .uri(&target)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-key", ws_key)
-        .header("sec-websocket-version", ws_version)
-        .body(Empty::new())
-        .unwrap();
+    let mut builder = Request::builder().method("GET").uri(&target);
+    for (k, v) in req.headers() {
+        if k != hyper::header::HOST {
+            builder = builder.header(k, v);
+        }
+    }
+    let ws_req = builder.body(Empty::new()).unwrap();
 
     match ws_client.request(ws_req).await {
         Ok(resp) => {
@@ -1158,5 +1149,82 @@ mod tests {
         // それ以外はワイルドカード → 200
         let (status, _) = get(&addr, "other.example.com").await;
         assert_eq!(status, 200);
+    }
+
+    // WS1: WebSocket ハンドシェイクが 101 を返し、sec-websocket-protocol が転送される
+    #[tokio::test]
+    async fn test_ws_WS1_handshake_and_protocol_forwarded() {
+        // WS バックエンドを立てる
+        let baddr = testutil::spawn_ws_backend().await;
+        let (ip, port) = baddr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+        let mut mc = MockContainer::new("ws", ip, port);
+        mc.running = true;
+        let mut c = testutil::make_container("ws", None);
+        c.port = Some(port);
+        c.startup_timeout = Duration::from_secs(3);
+        c.ip = Some(ip.to_string());
+        c.routes = vec![Route {
+            host: "ws.localhost".to_string(),
+            port: None,
+        }];
+
+        let (addr, _mock) = spawn_proxy(vec![mc], vec![c]).await;
+
+        // tokio-tungstenite クライアントで WS 接続(sec-websocket-protocol 付き)
+        let url = format!("ws://{}/ws", addr);
+        let req = hyper::http::Request::builder()
+            .uri(&url)
+            .header("host", "ws.localhost")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "vite-hmr")
+            .body(())
+            .unwrap();
+        let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        // バックエンドが受信した sec-websocket-protocol を応答に含める
+        assert_eq!(
+            resp.headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("vite-hmr")
+        );
+        ws.close(None).await.unwrap();
+    }
+
+    // WS2: WebSocket ハンドシェイクが 101 を返す(sec-websocket-protocol なしでも成立)
+    #[tokio::test]
+    async fn test_ws_WS2_handshake_without_protocol() {
+        let baddr = testutil::spawn_ws_backend().await;
+        let (ip, port) = baddr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+        let mut mc = MockContainer::new("ws", ip, port);
+        mc.running = true;
+        let mut c = testutil::make_container("ws", None);
+        c.port = Some(port);
+        c.startup_timeout = Duration::from_secs(3);
+        c.ip = Some(ip.to_string());
+        c.routes = vec![Route {
+            host: "ws.localhost".to_string(),
+            port: None,
+        }];
+
+        let (addr, _mock) = spawn_proxy(vec![mc], vec![c]).await;
+
+        let url = format!("ws://{}/ws", addr);
+        let req = hyper::http::Request::builder()
+            .uri(&url)
+            .header("host", "ws.localhost")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        let (_ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
     }
 }
