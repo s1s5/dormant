@@ -476,6 +476,7 @@ async fn handle_ws(
 
     // パスとヘッダーを先に取得
     let path = req.uri().path().to_string();
+    tracing::debug!("ws: handling upgrade for {} path={}", container.name, path);
 
     let client_upgraded_fut = hyper::upgrade::on(&mut req);
 
@@ -486,14 +487,24 @@ async fn handle_ws(
     let target = format!("http://{}/{}", target_addr, trim_leading_slash(&path));
     let mut builder = Request::builder().method("GET").uri(&target);
     for (k, v) in req.headers() {
-        if k != hyper::header::HOST {
+        // host は転送先アドレスに置き換わるため除外。
+        // origin はバックエンド(Vite 等)が検証して 400 を返すため除外(プロキシ経由では
+        // ブラウザのオリジンがバックエンドのオリジンと一致しない)。
+        // sec-websocket-extensions(permessage-deflate 等)は tungstenite ブリッジが
+        // 圧縮をサポートしないため除外。
+        if k != hyper::header::HOST
+            && k != hyper::header::ORIGIN
+            && k != "sec-websocket-extensions"
+        {
             builder = builder.header(k, v);
         }
     }
     let ws_req = builder.body(Empty::new()).unwrap();
+    tracing::debug!("ws: forwarding upgrade to {}", target);
 
     match ws_client.request(ws_req).await {
         Ok(resp) => {
+            tracing::debug!("ws: backend responded status={}", resp.status());
             if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
                 let backend_headers = resp.headers().clone();
                 let backend_upgraded = match hyper::upgrade::on(resp).await {
@@ -503,6 +514,7 @@ async fn handle_ws(
                         return Ok(error_response("upgrade failed", StatusCode::BAD_GATEWAY));
                     }
                 };
+                tracing::debug!("ws: backend upgraded, sending 101 to client");
 
                 // クライアントに101を返す
                 let mut resp101 = Response::new(
@@ -521,7 +533,9 @@ async fn handle_ws(
                 tokio::spawn(async move {
                     match client_upgraded_fut.await {
                         Ok(client_upgraded) => {
+                            tracing::debug!("ws: client upgraded, starting bridge");
                             bridge_websocket(client_upgraded, backend_upgraded).await;
+                            tracing::debug!("ws: bridge finished");
                         }
                         Err(e) => tracing::warn!("client upgrade error: {}", e),
                     }
@@ -561,26 +575,34 @@ async fn bridge_websocket(client_upgraded: Upgraded, backend_upgraded: Upgraded)
         None,
     )
     .await;
+    tracing::debug!("ws bridge: both sockets established");
 
     let (mut client_tx, mut client_rx) = client_ws.split();
     let (mut backend_tx, mut backend_rx) = backend_ws.split();
 
     let c2b = tokio::spawn(async move {
         while let Some(Ok(msg)) = client_rx.next().await {
+            tracing::debug!("ws bridge: client->backend msg type={:?}", msg);
             if backend_tx.send(msg).await.is_err() {
+                tracing::debug!("ws bridge: client->backend send failed");
                 break;
             }
         }
+        tracing::debug!("ws bridge: client->backend loop ended");
     });
     let b2c = tokio::spawn(async move {
         while let Some(Ok(msg)) = backend_rx.next().await {
+            tracing::debug!("ws bridge: backend->client msg type={:?}", msg);
             if client_tx.send(msg).await.is_err() {
+                tracing::debug!("ws bridge: backend->client send failed");
                 break;
             }
         }
+        tracing::debug!("ws bridge: backend->client loop ended");
     });
 
     let _ = tokio::try_join!(c2b, b2c);
+    tracing::debug!("ws bridge: both loops done");
 }
 
 fn trim_leading_slash(path: &str) -> String {

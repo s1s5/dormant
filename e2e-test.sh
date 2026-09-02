@@ -870,6 +870,57 @@ PYEOF
     return 1  # 接続中なのに停止した → 失敗
 }
 
+# E46: Origin ヘッダー付き WS 接続が通る (Origin 除外)
+# 検証: ブラウザは Origin ヘッダーを付けて WS 接続する。dormant が Origin を除外して
+#       バックエンドへ転送しないため、バックエンド (Vite 等) が Origin 検証で 400 を
+#       返さず、WS ハンドシェイクが成立してエコーが返ることを確認する。
+test_e46() {
+    local code
+    code=$(mktemp /tmp/dormant-wso.XXXXXX.py)
+    cat > "$code" <<'PYEOF'
+import asyncio
+import websockets
+
+async def handler(ws):
+    try:
+        while True:
+            msg = await ws.recv()
+            await ws.send(msg)
+    except websockets.ConnectionClosed:
+        pass
+
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", 8080):
+        await asyncio.Future()
+
+asyncio.run(main())
+PYEOF
+    docker run -d --name "$PREFIX-wso" --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=8080 \
+        --label dormant.startup.timeout=15s \
+        -v "$code":/ws.py:ro \
+        python:3.12-alpine sh -c \
+        "pip install -q --no-cache-dir websockets && python3 /ws.py" >/dev/null 2>&1 || return 1
+    rm -f "$code"
+    # Origin 付き WS エコーが通るまでリトライ (dormant 経由)
+    local deadline=$((SECONDS + 40))
+    local ok=1
+    while (( SECONDS < deadline )); do
+        if timeout 10 docker run --rm --network "$NETWORK" \
+            -e DORMANT_CONTAINER="$DORMANT_CONTAINER" \
+            -v "$(dirname "$0")/e2e-wsclient-origin.py":/client.py:ro \
+            python:3.12-alpine sh -c \
+            "pip install -q --no-cache-dir websockets && python3 /client.py" 2>/dev/null | grep -q "echo: hello"; then
+            ok=0
+            break
+        fi
+        sleep 2
+    done
+    docker rm -f "$PREFIX-wso" >/dev/null 2>&1
+    [ $ok -eq 0 ]
+}
+
 # E32: curl --http2 (h2c) でアクセス → 200
 # 検証: クライアント→dormant が HTTP/2 (cleartext) で通ること。
 test_e32() {
@@ -1615,6 +1666,7 @@ main() {
     run_test "E43 再起動後も全ホスト再付与 (self-alias)" test_e43
     run_test "E44 再作成で新ホストに追従 (self-alias)" test_e44
     run_test "E45 dormant.alias 専用でエイリアス付与+HTTP非ルーティング" test_e45
+    run_test "E46 Origin 付き WS 接続が通る (Origin 除外)" test_e46
 
     # サマリ
     echo
