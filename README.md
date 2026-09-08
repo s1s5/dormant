@@ -57,6 +57,54 @@ docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/dormant:lat
 | `--self-network` | `DORMANT_SELF_NETWORK` | (空) | 自身のネットワークエイリアスを付与するネットワーク名 |
 | `--static-routes` | `DORMANT_STATIC_ROUTES` | (空) | 静的ルート（dormant が管理しない外部固定宛先）。`ホストパターン=IP:ポート` の並びをカンマまたは改行で区切る |
 
+### podman（Docker 互換 API）での利用
+
+dormant は Docker Engine API クライアント（bollard）を Unix ソケット越しに使うため、
+podman が提供する Docker 互換 API ソケットを `DORMANT_DOCKER_SOCKET`（または `--docker-socket`）で指定すれば、そのまま利用できます。
+
+1. podman の Docker 互換 API ソケットを起動する:
+
+   ```bash
+   podman system service --time=0 unix:///run/user/$(id -u)/podman/podman.sock
+   ```
+
+2. dormant をソケットを指して起動する:
+
+   ```bash
+   DORMANT_DOCKER_SOCKET=/run/user/$(id -u)/podman/podman.sock dormant
+   ```
+
+#### dormant を podman コンテナで動かす場合
+
+dormant 自体を podman（rootless）のコンテナとして動かす場合は、podman のソケットをマウントして `DORMANT_DOCKER_SOCKET` を書き換えるだけで動きます。
+
+```bash
+podman run -d --name dormant \
+  -v /run/user/1000/podman:/run/podman \
+  -e DORMANT_DOCKER_SOCKET=/run/podman/podman.sock \
+  -e DORMANT_SELF_NETWORK=dormant \
+  dormant:latest
+```
+
+- ソケットは**ディレクトリごと**マウントするのが安全です（親ディレクトリのパーミッションが通らないと "Socket not found" になる）。
+- dormant は root 実行のため、rootless ソケット（uid 1000 所有）もそのまま読めます。非 root で動かす場合は `--userns=keep-id` 等の調整が必要です。
+- `podman system service` のソケットはプロセスを止めると消えるため、安定して使うなら systemd の `podman.socket` を有効化してください（`systemctl --user enable --now podman.socket`）。これで `$XDG_RUNTIME_DIR/podman/podman.sock` が自動で上がります。
+
+#### 互換性の検証結果（podman 5.7 / bollard 0.21・Docker API v1.53 要求）
+
+podman 5.7 の互換 API（Docker API v1.41 相当）に対して、dormant が使うエンドポイントを実測した結果:
+
+- コンテナ一覧 / inspect / start / stop — 動作確認済み
+- イベント購読（watch_events）— 購読は成立
+- ネットワーク connect / disconnect — エンドポイントは存在するが、alias 付き接続は未検証
+- バージョン交渉（negotiate_version）は不要（bollard の v1.53 要求のままでも podman は処理する）
+
+注意点:
+
+- dormant をコンテナで動かす場合は、podman ソケットをマウントして `DORMANT_DOCKER_SOCKET` を書き換えること
+- `dormant.alias`（ネットワークエイリアス付与）は podman 互換 API での動作を要確認
+- 多段 `depends_on` の連鎖起動は compose のラベル（`com.docker.compose.depends_on` 等）に依存するため、podman-compose が同等のラベルを付与するか要確認
+
 ### 静的ルート（外部固定宛先への直接転送）
 
 `DORMANT_STATIC_ROUTES` で、dormant が管理しない外部固定 IP:port への静的ルートを登録できます。
