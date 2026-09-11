@@ -382,6 +382,16 @@ async fn handle_ws_static(
         .unwrap_or_else(|| hyper::header::HeaderValue::from_static("13"));
     // 元の Host ヘッダーを保持する(転送先ホストのルーティングを維持するため)
     let orig_host = req.headers().get(hyper::header::HOST).cloned();
+    // Origin ヘッダーも保持して転送する。外部固定宛先(静止ルート)には openclaw の
+    // Control UI のように Origin 検証を行うバックエンドがあるため、Origin を落とすと
+    // origin not allowed になる。動的ルート(handle_ws)は Vite 等の開発サーバー向けに
+    // Origin を除外している点と対称に、静的ルートは転送する。
+    let orig_origin = req.headers().get(hyper::header::ORIGIN).cloned();
+    // sec-websocket-protocol も保持して転送する(Vite HMR 等のサブプロトコル要求に対応)
+    let orig_subproto = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .cloned();
 
     let client_upgraded_fut = hyper::upgrade::on(&mut req);
 
@@ -396,6 +406,12 @@ async fn handle_ws_static(
         .header("sec-websocket-version", ws_version);
     if let Some(h) = orig_host {
         ws_req_builder = ws_req_builder.header(hyper::header::HOST, h);
+    }
+    if let Some(o) = orig_origin {
+        ws_req_builder = ws_req_builder.header(hyper::header::ORIGIN, o);
+    }
+    if let Some(p) = orig_subproto {
+        ws_req_builder = ws_req_builder.header("sec-websocket-protocol", p);
     }
     let ws_req = ws_req_builder.body(Empty::new()).unwrap();
 
