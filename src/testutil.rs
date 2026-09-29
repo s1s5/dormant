@@ -287,53 +287,65 @@ pub async fn spawn_h2_backend() -> String {
 
 /// WebSocket エコーバックエンド: アップグレードを受け、受信したテキストをそのまま返す。
 /// 受信した `Sec-WebSocket-Protocol` を応答に含める(転送検証用)。
-pub async fn spawn_ws_backend() -> String {
+/// 受信したリクエスト URI の `path?query` を `path_tx` へ送る(クエリ文字列の転送検証用)。
+pub async fn spawn_ws_backend_with_capture(
+    path_tx: tokio::sync::oneshot::Sender<String>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let path_tx = Arc::new(Mutex::new(Some(path_tx)));
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            let path_tx = path_tx.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc = service_fn(move |req: Request<Incoming>| async move {
-                    // アップグレード要求なら 101 を返す
-                    let is_upgrade = req
-                        .headers()
-                        .get("upgrade")
-                        .map(|v| v.to_str().unwrap_or("").eq_ignore_ascii_case("websocket"))
-                        .unwrap_or(false);
-                    if is_upgrade {
-                        let mut resp = Response::new(Full::new(Bytes::new()));
-                        *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-                        resp.headers_mut().insert(
-                            "upgrade",
-                            hyper::header::HeaderValue::from_static("websocket"),
-                        );
-                        resp.headers_mut().insert(
-                            "connection",
-                            hyper::header::HeaderValue::from_static("Upgrade"),
-                        );
-                        // 受信した Sec-WebSocket-Key から正しい Accept を計算する
-                        if let Some(k) = req.headers().get("sec-websocket-key") {
-                            let key = k.to_str().unwrap_or("");
-                            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let path_tx = path_tx.clone();
+                    async move {
+                        // アップグレード要求の URI を捕捉する(oneshot は一度しか送れない)
+                        if let Some(tx) = path_tx.lock().unwrap().take() {
+                            let _ = tx.send(req.uri().to_string());
+                        }
+                        let is_upgrade = req
+                            .headers()
+                            .get("upgrade")
+                            .map(|v| v.to_str().unwrap_or("").eq_ignore_ascii_case("websocket"))
+                            .unwrap_or(false);
+                        if is_upgrade {
+                            let mut resp = Response::new(Full::new(Bytes::new()));
+                            *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
                             resp.headers_mut().insert(
-                                "sec-websocket-accept",
-                                hyper::header::HeaderValue::from_str(&accept).unwrap(),
+                                "upgrade",
+                                hyper::header::HeaderValue::from_static("websocket"),
                             );
+                            resp.headers_mut().insert(
+                                "connection",
+                                hyper::header::HeaderValue::from_static("Upgrade"),
+                            );
+                            // 受信した Sec-WebSocket-Key から正しい Accept を計算する
+                            if let Some(k) = req.headers().get("sec-websocket-key") {
+                                let key = k.to_str().unwrap_or("");
+                                let accept =
+                                    tungstenite::handshake::derive_accept_key(key.as_bytes());
+                                resp.headers_mut().insert(
+                                    "sec-websocket-accept",
+                                    hyper::header::HeaderValue::from_str(&accept).unwrap(),
+                                );
+                            }
+                            // 受信した Sec-WebSocket-Protocol をそのまま返す
+                            if let Some(p) = req.headers().get("sec-websocket-protocol") {
+                                resp.headers_mut()
+                                    .insert("sec-websocket-protocol", p.clone());
+                            }
+                            Ok::<_, std::io::Error>(resp)
+                        } else {
+                            let mut resp = Response::new(Full::new(Bytes::from_static(b"ok")));
+                            *resp.status_mut() = StatusCode::OK;
+                            Ok::<_, std::io::Error>(resp)
                         }
-                        // 受信した Sec-WebSocket-Protocol をそのまま返す
-                        if let Some(p) = req.headers().get("sec-websocket-protocol") {
-                            resp.headers_mut()
-                                .insert("sec-websocket-protocol", p.clone());
-                        }
-                        Ok::<_, std::io::Error>(resp)
-                    } else {
-                        let mut resp = Response::new(Full::new(Bytes::from_static(b"ok")));
-                        *resp.status_mut() = StatusCode::OK;
-                        Ok::<_, std::io::Error>(resp)
                     }
                 });
                 let _ = http1::Builder::new().serve_connection(io, svc).await;
@@ -341,6 +353,12 @@ pub async fn spawn_ws_backend() -> String {
         }
     });
     addr
+}
+
+/// WebSocket エコーバックエンド(クエリ捕捉なし)
+pub async fn spawn_ws_backend() -> String {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    spawn_ws_backend_with_capture(tx).await
 }
 
 /// モック Docker サーバーを立て、DockerClient と状態確認用 MockDocker を返す

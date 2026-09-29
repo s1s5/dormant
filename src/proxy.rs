@@ -368,8 +368,13 @@ async fn handle_ws_static(
     ws_client: WsClient,
     target_addr: &str,
 ) -> Result<BoxResp, Infallible> {
-    // パスとヘッダーを先に取得
-    let path = req.uri().path().to_string();
+    // パスとヘッダーを先に取得(クエリ文字列も保持する)
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
     let ws_key = req
         .headers()
         .get("sec-websocket-key")
@@ -490,8 +495,13 @@ async fn handle_ws(
             }
         };
 
-    // パスとヘッダーを先に取得
-    let path = req.uri().path().to_string();
+    // パスとヘッダーを先に取得(クエリ文字列も保持する)
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
     tracing::debug!("ws: handling upgrade for {} path={}", container.name, path);
 
     let client_upgraded_fut = hyper::upgrade::on(&mut req);
@@ -1264,5 +1274,72 @@ mod tests {
             .unwrap();
         let (_ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    }
+
+    // WS3: 動的ルート転送でもクエリ文字列が保持される
+    // 修正前: uri().path() のみを転送していたため ? 以降がバックエンドに届かなかった。
+    #[tokio::test]
+    async fn test_ws_WS3_query_string_forwarded_dynamic() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let baddr = testutil::spawn_ws_backend_with_capture(tx).await;
+        let (ip, port) = baddr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+        let mut mc = MockContainer::new("ws", ip, port);
+        mc.running = true;
+        let mut c = testutil::make_container("ws", None);
+        c.port = Some(port);
+        c.startup_timeout = Duration::from_secs(3);
+        c.ip = Some(ip.to_string());
+        c.routes = vec![Route {
+            host: "ws.localhost".to_string(),
+            port: None,
+        }];
+
+        let (addr, _mock) = spawn_proxy(vec![mc], vec![c]).await;
+
+        let url = format!("ws://{}/ws?foo=bar&baz=1", addr);
+        let req = hyper::http::Request::builder()
+            .uri(&url)
+            .header("host", "ws.localhost")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        // バックエンドが受信したリクエスト URI にクエリが含まれること
+        let got = rx.await.unwrap();
+        assert!(got.contains("/ws?foo=bar&baz=1"), "backend uri = {got}");
+        ws.close(None).await.unwrap();
+    }
+
+    // WS4: 静的ルート転送でもクエリ文字列が保持される
+    #[tokio::test]
+    async fn test_ws_WS4_query_string_forwarded_static() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let baddr = testutil::spawn_ws_backend_with_capture(tx).await;
+        let (ip, port) = baddr.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        let (addr, _mock) =
+            spawn_proxy_with_static(vec![], vec![], vec![sre("ws.example.com", ip, port)]).await;
+
+        let url = format!("ws://{}/ws?foo=bar&baz=1", addr);
+        let req = hyper::http::Request::builder()
+            .uri(&url)
+            .header("host", "ws.example.com")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let got = rx.await.unwrap();
+        assert!(got.contains("/ws?foo=bar&baz=1"), "backend uri = {got}");
+        ws.close(None).await.unwrap();
     }
 }

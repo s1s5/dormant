@@ -921,6 +921,63 @@ PYEOF
     [ $ok -eq 0 ]
 }
 
+# E47: WS 転送でクエリ文字列が保持される
+# 検証: バックエンド (websockets) が受信したリクエストパス (クエリ込み) を返し、
+#       dormant 経由の WS 接続で ?probe=1&x=2 が落ちずに届くことを確認する。
+#       修正前は uri().path() のみを転送していたためクエリが消えていた。
+test_e47() {
+    local code
+    code=$(mktemp /tmp/dormant-wsq.XXXXXX.py)
+    cat > "$code" <<'PYEOF'
+import asyncio
+import websockets
+
+async def handler(ws):
+    try:
+        path = ws.request.path
+    except AttributeError:
+        path = ws.path
+    try:
+        while True:
+            await ws.recv()
+            await ws.send("path:" + path)
+    except websockets.ConnectionClosed:
+        pass
+
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", 8080):
+        await asyncio.Future()
+
+asyncio.run(main())
+PYEOF
+    docker run -d --name "$PREFIX-wsq" --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.port=8080 \
+        --label dormant.startup.timeout=15s \
+        -v "$code":/ws.py:ro \
+        python:3.12-alpine sh -c \
+        "pip install -q --no-cache-dir websockets && python3 /ws.py" >/dev/null 2>&1 || return 1
+    rm -f "$code"
+    # dormant 経由の WS エコーが通るまでリトライ
+    local deadline=$((SECONDS + 40))
+    local ok=1
+    while (( SECONDS < deadline )); do
+        local out
+        out=$(timeout 10 docker run --rm --network "$NETWORK" \
+            -e DORMANT_CONTAINER="$DORMANT_CONTAINER" \
+            -v "$(dirname "$0")/e2e-wsclient-query.py":/client.py:ro \
+            python:3.12-alpine sh -c \
+            "pip install -q --no-cache-dir websockets && python3 /client.py" 2>/dev/null) || true
+        if grep -q "probe=1" <<<"$out" && grep -q "x=2" <<<"$out"; then
+            ok=0
+            break
+        fi
+        sleep 2
+    done
+    docker rm -f "$PREFIX-wsq" >/dev/null 2>&1
+    [ $ok -eq 0 ]
+}
+
 # E32: curl --http2 (h2c) でアクセス → 200
 # 検証: クライアント→dormant が HTTP/2 (cleartext) で通ること。
 test_e32() {
@@ -1667,6 +1724,7 @@ main() {
     run_test "E44 再作成で新ホストに追従 (self-alias)" test_e44
     run_test "E45 dormant.alias 専用でエイリアス付与+HTTP非ルーティング" test_e45
     run_test "E46 Origin 付き WS 接続が通る (Origin 除外)" test_e46
+    run_test "E47 WS 転送でクエリ文字列が保持される" test_e47
 
     # サマリ
     echo
