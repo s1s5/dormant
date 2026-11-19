@@ -9,7 +9,7 @@
 # 実行:
 #   ./e2e-test.sh
 #
-# 検証パターン: E1 〜 E38 (plan-e2e-test.md, plan-e2e-ip-change.md, plan-e2e-self-alias.md 参照)
+# 検証パターン: E1 〜 E50 (plan-e2e-test.md, plan-e2e-ip-change.md, plan-e2e-self-alias.md 参照)
 #   各パターンを関数化し、pass/fail を判定して最後にサマリを表示する。
 #   テスト用コンテナはすべて <PREFIX>-* という名前で作成し、
 #   スクリプト終了時に trap 経由で必ず削除する。
@@ -422,8 +422,15 @@ test_e17() {
         nginx:alpine >/dev/null 2>&1 || return 1
     docker stop "$PREFIX-e17db" >/dev/null || return 1
     docker stop "$PREFIX-e17app" >/dev/null || return 1
-    local code
-    code=$(http_code "$PREFIX-e17app") || true
+    # ルート登録(イベント経由の同期)が追いつく前に叩くと 404 になるため、
+    # 200 になるまでリトライする。起動連鎖そのものは最後の running チェックで担保する
+    local code=""
+    local deadline=$((SECONDS + 30))
+    while (( SECONDS < deadline )); do
+        code=$(http_code "$PREFIX-e17app") || true
+        [ "$code" = "200" ] && break
+        sleep 1
+    done
     [ "$code" = "200" ] || return 1
     container_running "$PREFIX-e17db" || return 1   # 依存が起動している
     container_running "$PREFIX-e17app" || return 1
@@ -572,8 +579,11 @@ test_e21b() {
     wait_http "$PREFIX-e21bapp2" 200 15 || return 1
     container_running "$PREFIX-e21bdb" || return 1
     # app1 へのアクセスを止めてアイドル停止を待つ
+    # app2 は参照元としてアクティブに保つ (touch し続けないと app2 も
+    # session-duration=10s で停止し、その時点で db が止まるのが正しい挙動)
     local deadline=$((SECONDS + 60))
     while (( SECONDS < deadline )); do
+        curl -s -o /dev/null -m 5 -H "Host: $PREFIX-e21bapp2" "$BASE_URL/" || true
         if ! container_running "$PREFIX-e21bapp1"; then
             # app1 は停止した。db は app2 が参照しているので残っているはず
             if container_running "$PREFIX-e21bdb" && container_running "$PREFIX-e21bapp2"; then
@@ -851,23 +861,21 @@ PYEOF
     done
     [ $ok -eq 0 ] || { docker rm -f "$PREFIX-wss" >/dev/null 2>&1; return 1; }
     # WS 接続を保持したまま session-duration (10s) を超えるまで待つ
-    timeout 25 docker run --rm --network "$NETWORK" \
+    # keep.py は自前で終了しないため、名前付きコンテナ + rm -f で確実に回収する。
+    # (以前は --rm の匿名コンテナが漏れ、kill しても wait が返らず E31 が固まった)
+    docker run -d --name "$PREFIX-wskeep" --network "$NETWORK" \
         -e DORMANT_CONTAINER="$DORMANT_CONTAINER" \
         -v "$(dirname "$0")/e2e-wskeep.py":/keep.py:ro \
         python:3.12-alpine sh -c \
-        "pip install -q --no-cache-dir websockets && python3 /keep.py" >/dev/null 2>&1 &
-    local cpid=$!
-    sleep 12
-    if container_running "$PREFIX-wss"; then
-        kill "$cpid" 2>/dev/null
-        wait "$cpid" 2>/dev/null
-        docker rm -f "$PREFIX-wss" >/dev/null 2>&1
-        return 0  # 接続中は停止しない
-    fi
-    kill "$cpid" 2>/dev/null
-    wait "$cpid" 2>/dev/null
+        "pip install -q --no-cache-dir websockets && python3 /keep.py" >/dev/null 2>&1 \
+        || { docker rm -f "$PREFIX-wss" >/dev/null 2>&1; return 1; }
+    # pip install (~3s) + 接続確立 + session-duration 10s を確実に超えるまで保持する
+    sleep 15
+    local alive=1
+    container_running "$PREFIX-wss" && alive=0
+    docker rm -f "$PREFIX-wskeep" >/dev/null 2>&1
     docker rm -f "$PREFIX-wss" >/dev/null 2>&1
-    return 1  # 接続中なのに停止した → 失敗
+    [ $alive -eq 0 ]
 }
 
 # E46: Origin ヘッダー付き WS 接続が通る (Origin 除外)
@@ -1030,21 +1038,45 @@ PYEOF
     # ヘルスチェック付きで ready を待つ (gRPC はHTTP/2でポート疎通だけでは不十分なため)
     sleep 8  # pip install + サーバー起動待ち
     # 転送が通るまでリトライ (grpcurl は dormant 経由で gRPC バックエンドに到達)
+    # reflection は使わない: 新しい grpcurl は grpc.reflection.v1 を先に試すが、
+    # python の grpcio は v1alpha しか公開しないため descriptor 取得で失敗する。
+    # proto を直接渡して reflection 依存をなくす。
+    local proto
+    proto=$(mktemp /tmp/dormant-health.XXXXXX.proto)
+    # grpcurl イメージは非 root で動くため、mktemp の 0600 のままだと読めない
+    chmod 644 "$proto"
+    cat > "$proto" <<'PROTO'
+syntax = "proto3";
+package grpc.health.v1;
+message HealthCheckRequest { string service = 1; }
+message HealthCheckResponse {
+  enum ServingStatus { UNKNOWN = 0; SERVING = 1; NOT_SERVING = 2; SERVICE_UNKNOWN = 3; }
+  ServingStatus status = 1;
+}
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+PROTO
+    local ok=1
     local deadline=$((SECONDS + 40))
     while (( SECONDS < deadline )); do
         local out rc
-        out=$(timeout 5 docker run --rm --network "$NETWORK" fullstorydev/grpcurl \
-            -plaintext -d '{}' \
+        out=$(timeout 10 docker run --rm --network "$NETWORK" \
+            -v "$proto":/health.proto:ro \
+            fullstorydev/grpcurl -plaintext -import-path / -proto health.proto \
+            -d '{}' \
             -authority "$PREFIX-grpc" \
             "$DORMANT_CONTAINER:18000" grpc.health.v1.Health/Check 2>&1) && rc=0 || rc=1
         if [ $rc -eq 0 ]; then
             case "$out" in
-                *"SERVING"*) return 0 ;;
+                *"SERVING"*) ok=0; break ;;
             esac
         fi
         sleep 2
     done
-    return 1
+    rm -f "$proto"
+    return $ok
 }
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1210,7 @@ CONF
         --label dormant.port=80 \
         --label dormant.startup.timeout=15s \
         --label "dormant.host=mp80.example.localhost:80,mp8080.example.localhost:8080" \
-        -v "$code":/etc/nginx/conf.d/multi.conf:ro \
+        -v "$code":/etc/nginx/conf.d/default.conf:ro \
         nginx:alpine >/dev/null 2>&1
     local rc=$?
     rm -f "$code"
@@ -1648,6 +1680,126 @@ test_e45() {
     return 0
 }
 
+# E48: 起動イベント連動 (dormant.trigger-group)
+#       dormant 管理外(トリガー側は dormant.enable なし)のコンテナを docker start すると、
+#       指定グループのメンバーが連動起動される
+#       トリガー: e48trigger (dormant.trigger-group=e2e48-helper)
+#       対象:     e48helper  (dormant.enable=true, dormant.group=e2e48-helper, ポートなし)
+test_e48() {
+    docker create --name "$PREFIX-e48helper" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.group=e2e48-helper \
+        --label com.docker.compose.project=e2e48 \
+        --label com.docker.compose.service=helper \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker create --name "$PREFIX-e48trigger" \
+        --network "$NETWORK" \
+        --label dormant.trigger-group=e2e48-helper \
+        --label com.docker.compose.project=e2e48 \
+        --label com.docker.compose.service=trigger \
+        nginx:alpine >/dev/null 2>&1 || return 1
+
+    # 前提: どちらも停止状態
+    if container_running "$PREFIX-e48helper" || container_running "$PREFIX-e48trigger"; then
+        echo "    (FAIL) 前提: e48 のコンテナは停止状態であるべき"
+        return 1
+    fi
+
+    # トリガーを起動 → グループメンバー(e48helper)が連動起動される
+    docker start "$PREFIX-e48trigger" >/dev/null || return 1
+    local deadline=$((SECONDS + 20))
+    while (( SECONDS < deadline )); do
+        if container_running "$PREFIX-e48helper"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "    (FAIL) trigger 起動後 20 秒以内にグループメンバーが起動しませんでした"
+    return 1
+}
+
+# E49: 停止イベント連動
+#       A/B の両方が X に depends_on。片方だけ停止 → X は running のまま、
+#       両方停止 → X も停止される(参照元が running でなくなったときのみ停止)
+#       A/B は dormant 管理外(awaken 相当)でも参照元として数える
+test_e49() {
+    docker create --name "$PREFIX-e49helper" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label com.docker.compose.project=e2e49 \
+        --label com.docker.compose.service=helper \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker create --name "$PREFIX-e49app" \
+        --network "$NETWORK" \
+        --label com.docker.compose.project=e2e49 \
+        --label com.docker.compose.service=app \
+        --label com.docker.compose.depends_on=helper:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker create --name "$PREFIX-e49worker" \
+        --network "$NETWORK" \
+        --label com.docker.compose.project=e2e49 \
+        --label com.docker.compose.service=worker \
+        --label com.docker.compose.depends_on=helper:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+
+    docker start "$PREFIX-e49helper" "$PREFIX-e49app" "$PREFIX-e49worker" >/dev/null 2>&1 \
+        || return 1
+    sleep 2
+
+    # app だけ停止 → worker が running なので helper は残る
+    docker stop "$PREFIX-e49app" >/dev/null 2>&1 || return 1
+    sleep 5
+    if ! container_running "$PREFIX-e49helper"; then
+        echo "    (FAIL) worker が running なのに helper が停止しました"
+        return 1
+    fi
+    if ! container_running "$PREFIX-e49worker"; then
+        echo "    (FAIL) 管理外コンテナ worker が停止させられました"
+        return 1
+    fi
+
+    # worker も停止 → 参照元がいなくなるので helper も停止
+    docker stop "$PREFIX-e49worker" >/dev/null 2>&1 || return 1
+    local deadline=$((SECONDS + 20))
+    while (( SECONDS < deadline )); do
+        if ! container_running "$PREFIX-e49helper"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "    (FAIL) 参照元が全停止しても helper が停止しませんでした"
+    return 1
+}
+
+# E50: always-on の依存先は停止されない
+#       X(always-on) を A が depends_on。A を停止しても X は running のまま
+test_e50() {
+    docker create --name "$PREFIX-e50helper" \
+        --network "$NETWORK" \
+        --label dormant.enable=true \
+        --label dormant.always-on=true \
+        --label com.docker.compose.project=e2e50 \
+        --label com.docker.compose.service=helper \
+        nginx:alpine >/dev/null 2>&1 || return 1
+    docker create --name "$PREFIX-e50app" \
+        --network "$NETWORK" \
+        --label com.docker.compose.project=e2e50 \
+        --label com.docker.compose.service=app \
+        --label com.docker.compose.depends_on=helper:service_started:false \
+        nginx:alpine >/dev/null 2>&1 || return 1
+
+    docker start "$PREFIX-e50helper" "$PREFIX-e50app" >/dev/null 2>&1 || return 1
+    sleep 2
+    docker stop "$PREFIX-e50app" >/dev/null 2>&1 || return 1
+    sleep 8
+    if container_running "$PREFIX-e50helper"; then
+        return 0
+    fi
+    echo "    (FAIL) always-on の helper が停止連動で停止されました"
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
@@ -1725,6 +1877,9 @@ main() {
     run_test "E45 dormant.alias 専用でエイリアス付与+HTTP非ルーティング" test_e45
     run_test "E46 Origin 付き WS 接続が通る (Origin 除外)" test_e46
     run_test "E47 WS 転送でクエリ文字列が保持される" test_e47
+    run_test "E48 起動イベントで trigger-group のグループを連動起動" test_e48
+    run_test "E49 参照元が全停止したら依存先も連動停止" test_e49
+    run_test "E50 always-on の依存先は停止連動で止まらない" test_e50
 
     # サマリ
     echo

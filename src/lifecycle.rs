@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::config::*;
-use crate::docker::{DockerClient, ManagedContainer};
+use crate::docker::{DependencyRef, DockerClient, ManagedContainer};
 use crate::router::Router;
 
 /// コンテナごとの最終アクセス時刻とセッション情報
@@ -116,6 +116,15 @@ pub async fn idle_loop(
 ) {
     loop {
         sleep(Duration::from_secs(interval_secs)).await;
+        // 停止連動用の参照グラフ(管理外も含む)。取得できなければ従来の静的判定にフォールバック
+        let refs = match docker.list_dependency_refs().await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("dependency refs unavailable, fallback to static graph: {}", e);
+                None
+            }
+        };
+        let refs = refs.as_deref();
         let expired = sessions.expired().await;
         for id in expired {
             let containers = router.containers().await;
@@ -127,7 +136,7 @@ pub async fn idle_loop(
                 }
                 Some(c) => {
                     // D3: 依存先(管理対象)を連鎖停止
-                    for c in stop_chain(c, &containers, MAX_DEPENDENCY_DEPTH) {
+                    for c in stop_chain_with_refs(c, &containers, MAX_DEPENDENCY_DEPTH, refs) {
                         if let Err(e) = docker.stop(&c.id).await {
                             tracing::warn!("failed to stop {}: {}", c.id, e);
                         }
@@ -159,11 +168,23 @@ pub async fn idle_loop(
     }
 }
 
-/// 停止対象とその依存先(管理対象のみ)を連鎖的に収集
+/// 停止対象とその依存先(管理対象のみ)を連鎖的に収集する(従来の静的グラフ判定)
+#[cfg(test)]
 pub fn stop_chain(
     target: &ManagedContainer,
     containers: &[ManagedContainer],
     max_depth: usize,
+) -> Vec<ManagedContainer> {
+    stop_chain_with_refs(target, containers, max_depth, None)
+}
+
+/// 停止対象とその依存先(管理対象のみ)を連鎖的に収集する
+/// refs が Some なら、静的グラフではなく実測の参照グラフ(running な参照元の有無)で保護判定する
+pub fn stop_chain_with_refs(
+    target: &ManagedContainer,
+    containers: &[ManagedContainer],
+    max_depth: usize,
+    refs: Option<&[DependencyRef]>,
 ) -> Vec<ManagedContainer> {
     let mut out = vec![target.clone()];
     let mut visited = HashSet::from([target.id.clone()]);
@@ -173,8 +194,16 @@ pub fn stop_chain(
             continue;
         }
         for dep in c.resolve_dependencies(containers) {
+            // always-on(停止させない)コンテナは連鎖停止の対象外
+            if dep.always_on {
+                continue;
+            }
             // 親が停止対象外の他のコンテナからも参照されている場合は止めない(共有依存保護)
-            if is_shared_dependency(&dep, containers, &visited) {
+            let shared = match refs {
+                Some(refs) => has_running_referrer(&dep.id, refs, &visited),
+                None => is_shared_dependency(&dep, containers, &visited),
+            };
+            if shared {
                 continue;
             }
             if visited.insert(dep.id.clone()) {
@@ -184,6 +213,82 @@ pub fn stop_chain(
         }
     }
     out
+}
+
+/// dep を depends_on で参照しているコンテナのうち、running かつ exclude 外のものがあるか
+/// (参照元は同一 compose プロジェクトのコンテナに限る)
+fn has_running_referrer(
+    dep_id: &str,
+    refs: &[DependencyRef],
+    exclude: &HashSet<String>,
+) -> bool {
+    let Some(dep) = refs.iter().find(|r| r.id == dep_id) else {
+        return false;
+    };
+    let Some(service) = dep.compose_service.as_deref() else {
+        return false;
+    };
+    refs.iter().any(|r| {
+        r.id != dep_id
+            && r.running
+            && !exclude.contains(&r.id)
+            && r.compose_project.as_deref() == dep.compose_project.as_deref()
+            && r.depends_on.iter().any(|d| d.service == service)
+    })
+}
+
+/// 停止イベント起点の連鎖停止
+/// T の依存先のうち、dormant 管理下で running かつ running な参照元が無いものを停止し、再帰する
+pub async fn stop_orphan_dependents(
+    docker: &DockerClient,
+    router: &Router,
+    stopped_id: &str,
+) -> Result<()> {
+    let refs = docker.list_dependency_refs().await?;
+    let always_on: HashSet<String> = router
+        .containers()
+        .await
+        .iter()
+        .filter(|c| c.always_on)
+        .map(|c| c.id.clone())
+        .collect();
+    let mut stopped = HashSet::from([stopped_id.to_string()]);
+    let mut queue = VecDeque::from([(stopped_id.to_string(), 0usize)]);
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPENDENCY_DEPTH {
+            continue;
+        }
+        let Some(src) = refs.iter().find(|r| r.id == id) else {
+            continue;
+        };
+        for d in &src.depends_on {
+            let Some(dep) = refs.iter().find(|r| {
+                r.compose_project.as_deref() == src.compose_project.as_deref()
+                    && r.compose_service.as_deref() == Some(d.service.as_str())
+            }) else {
+                continue;
+            };
+            if !dep.managed
+                || !dep.running
+                || always_on.contains(&dep.id)
+                || stopped.contains(&dep.id)
+            {
+                continue;
+            }
+            if has_running_referrer(&dep.id, &refs, &stopped) {
+                continue;
+            }
+            tracing::info!("no running referrer, stopping dependency {}", dep.id);
+            if let Err(e) = docker.stop(&dep.id).await {
+                tracing::warn!("failed to stop {}: {}", dep.id, e);
+                continue;
+            }
+            docker.forget_started(&dep.id).await;
+            stopped.insert(dep.id.clone());
+            queue.push_back((dep.id.clone(), depth + 1));
+        }
+    }
+    Ok(())
 }
 
 /// dep を depends_on で参照しているコンテナのうち、
@@ -480,6 +585,24 @@ pub async fn ensure_group_started(
     }
 }
 
+/// 起動イベント起点のグループ連動起動
+/// グループに管理対象メンバーがいなければ warn して何もしない(fail しない)
+pub async fn trigger_group_start(
+    docker: &DockerClient,
+    router: &Router,
+    group: &str,
+) -> Result<()> {
+    if router.group_containers(group).await.is_empty() {
+        tracing::warn!(
+            "trigger-group '{}' has no managed member (dormant.enable), ignoring",
+            group
+        );
+        return Ok(());
+    }
+    tracing::info!("trigger-group '{}' start", group);
+    ensure_group_started(docker, router, group).await
+}
+
 /// IP とポートから転送先アドレスを組み立てる(ポート未指定は IP のみ)
 fn addr_with_port(ip: &str, port: Option<u16>) -> String {
     match port {
@@ -528,7 +651,7 @@ async fn http_status_ok(addr: &str, path: &str, allowed: &[u16]) -> bool {
 mod tests {
     use super::*;
     use crate::docker::Dependency;
-    use crate::testutil::MockContainer;
+    use crate::testutil::{compose_labels, MockContainer};
     use http_body_util::Full;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
@@ -679,6 +802,164 @@ mod tests {
             service: service.to_string(),
             condition: condition.to_string(),
         }
+    }
+
+    fn dref(id: &str, service: &str, running: bool, depends_on: &[&str]) -> DependencyRef {
+        DependencyRef {
+            id: id.to_string(),
+            running,
+            compose_project: Some("proj".to_string()),
+            compose_service: Some(service.to_string()),
+            depends_on: depends_on
+                .iter()
+                .map(|s| dep(s, "service_started"))
+                .collect(),
+            managed: true,
+        }
+    }
+
+    #[test]
+    fn test_has_running_referrer() {
+        let a = dref("a", "a", false, &["x"]);
+        let b = dref("b", "b", false, &["x"]);
+        let x = dref("x", "x", true, &[]);
+        let exclude = HashSet::from(["a".to_string()]);
+        // 参照元 a は停止済み → running な参照元なし
+        assert!(!has_running_referrer("x", &[a.clone(), b.clone(), x.clone()], &exclude));
+        // b が running → 参照元あり
+        let mut b_running = b.clone();
+        b_running.running = true;
+        assert!(has_running_referrer("x", &[a.clone(), b_running, x.clone()], &exclude));
+        // 別プロジェクトの参照元は数えない
+        let mut other = dref("c", "c", true, &["x"]);
+        other.compose_project = Some("other".to_string());
+        assert!(!has_running_referrer("x", &[a.clone(), other, x.clone()], &exclude));
+        // 参照先が無い
+        assert!(!has_running_referrer("ghost", &[a, x], &exclude));
+    }
+
+    #[test]
+    fn test_stop_chain_refs_keeps_when_referrer_running() {
+        // a→x, b→x。a 停止時、b が running なら x は止めない
+        let x = make_container("x", "x", "proj", vec![]);
+        let a = make_container("a", "a", "proj", vec![dep("x", "service_started")]);
+        let b = make_container("b", "b", "proj", vec![dep("x", "service_started")]);
+        let containers = vec![x.clone(), a.clone(), b.clone()];
+        let refs = vec![
+            dref("a", "a", false, &["x"]),
+            dref("b", "b", true, &["x"]),
+            dref("x", "x", true, &[]),
+        ];
+        let ids: Vec<_> = stop_chain_with_refs(&a, &containers, 10, Some(&refs))
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn test_stop_orphan_dependents_keeps_while_referrer_running() -> Result<()> {
+        let mut x = MockContainer::new("x", "172.20.0.9", 0);
+        x.running = true;
+        x.labels = compose_labels("proj", "x", "");
+        let a = MockContainer {
+            labels: compose_labels("proj", "a", "x:service_started:false"),
+            ..MockContainer::new("a", "172.20.0.9", 80)
+        };
+        let mut b = MockContainer::new("b", "172.20.0.9", 80);
+        b.running = true;
+        b.labels = compose_labels("proj", "b", "x:service_started:false");
+        let (docker, mock) = mock(vec![x, a, b]).await;
+        let router = Router::new();
+
+        // a 停止時: b が running なので x は残す
+        stop_orphan_dependents(&docker, &router, "a").await?;
+        assert!(mock.is_running("x"), "running な参照元 b があるので x は残る");
+
+        // b も停止 → x は参照元がなくなり停止される
+        docker.stop("b").await?;
+        stop_orphan_dependents(&docker, &router, "b").await?;
+        assert!(!mock.is_running("x"), "参照元が全て停止したら x も停止");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_orphan_dependents_ignores_unmanaged() -> Result<()> {
+        let mut x = MockContainer::new("x", "172.20.0.9", 0);
+        x.running = true;
+        x.managed = false;
+        x.labels = compose_labels("proj", "x", "");
+        let a = MockContainer {
+            labels: compose_labels("proj", "a", "x:service_started:false"),
+            ..MockContainer::new("a", "172.20.0.9", 80)
+        };
+        let (docker, mock) = mock(vec![x, a]).await;
+        stop_orphan_dependents(&docker, &Router::new(), "a").await?;
+        assert!(mock.is_running("x"), "管理外コンテナは停止しない");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stop_chain_keeps_always_on_dependency() {
+        // x は always-on。a 停止時でも x は止めない(refs なし/ありどちらも)
+        let mut x = make_container("x", "x", "proj", vec![]);
+        x.always_on = true;
+        let a = make_container("a", "a", "proj", vec![dep("x", "service_started")]);
+        let containers = vec![x.clone(), a.clone()];
+        let ids: Vec<_> = stop_chain(&a, &containers, 10)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["a"]);
+        let refs = vec![
+            dref("a", "a", false, &["x"]),
+            dref("x", "x", true, &[]),
+        ];
+        let ids: Vec<_> = stop_chain_with_refs(&a, &containers, 10, Some(&refs))
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn test_stop_orphan_dependents_keeps_always_on() -> Result<()> {
+        let mut x = MockContainer::new("x", "172.20.0.9", 0);
+        x.running = true;
+        x.labels = compose_labels("proj", "x", "");
+        let a = MockContainer {
+            labels: compose_labels("proj", "a", "x:service_started:false"),
+            ..MockContainer::new("a", "172.20.0.9", 80)
+        };
+        let (docker, mock) = mock(vec![x, a]).await;
+        let mut c = crate::testutil::make_container("x", None);
+        c.compose_project = Some("proj".to_string());
+        c.compose_service = Some("x".to_string());
+        c.always_on = true;
+        let router = Router::new();
+        router.update(vec![c]).await;
+        stop_orphan_dependents(&docker, &router, "a").await?;
+        assert!(mock.is_running("x"), "always-on の依存先は停止しない");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stop_chain_refs_stops_when_no_referrer_running() {
+        // a→x, b→x。a も b も停止済みなら x も止める
+        let x = make_container("x", "x", "proj", vec![]);
+        let a = make_container("a", "a", "proj", vec![dep("x", "service_started")]);
+        let b = make_container("b", "b", "proj", vec![dep("x", "service_started")]);
+        let containers = vec![x.clone(), a.clone(), b.clone()];
+        let refs = vec![
+            dref("a", "a", false, &["x"]),
+            dref("b", "b", false, &["x"]),
+            dref("x", "x", true, &[]),
+        ];
+        let ids: Vec<_> = stop_chain_with_refs(&a, &containers, 10, Some(&refs))
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(ids.contains(&"a".to_string()) && ids.contains(&"x".to_string()));
     }
 
     #[test]

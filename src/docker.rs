@@ -11,11 +11,12 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::config::*;
+use crate::lifecycle::{stop_orphan_dependents, trigger_group_start};
 use crate::router::Router;
 
 /// compose depends_on の1エントリ
@@ -25,6 +26,23 @@ pub struct Dependency {
     pub service: String,
     /// コンディション(service_started / service_healthy / ...)
     pub condition: String,
+}
+
+/// 依存参照グラフの1ノード(管理外コンテナも含む読み取り専用の情報)
+#[derive(Debug, Clone)]
+pub struct DependencyRef {
+    /// コンテナID
+    pub id: String,
+    /// running 状態か
+    pub running: bool,
+    /// compose プロジェクト名
+    pub compose_project: Option<String>,
+    /// compose サービス名
+    pub compose_service: Option<String>,
+    /// compose depends_on エントリ
+    pub depends_on: Vec<Dependency>,
+    /// dormant 管理下(dormant.enable=true)か
+    pub managed: bool,
 }
 
 /// TCP転送の公開設定
@@ -101,6 +119,10 @@ pub struct DockerClient {
     /// テスト用: 自身のコンテナIDの上書き(/etc/hostname 解決の代わり)
     #[cfg(test)]
     self_id: Arc<RwLock<Option<String>>>,
+    /// trigger-group 連動起動のデデュープ(group 名 → 最終発火時刻)
+    trigger_claims: Arc<Mutex<HashMap<String, Instant>>>,
+    /// 停止イベント連動のデデュープ(停止したコンテナID → 最終発火時刻)
+    stop_claims: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl DockerClient {
@@ -112,6 +134,8 @@ impl DockerClient {
             started_by_dormant: Arc::new(RwLock::new(HashSet::new())),
             #[cfg(test)]
             self_id: Arc::new(RwLock::new(None)),
+            trigger_claims: Arc::new(Mutex::new(HashMap::new())),
+            stop_claims: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -244,6 +268,16 @@ impl DockerClient {
         *self.self_id.write().await = id;
     }
 
+    /// trigger-group 連動起動のデデュープ。ttl 以内の再発火なら false
+    pub fn claim_trigger(&self, group: &str, ttl: Duration) -> bool {
+        claim(&self.trigger_claims, group, ttl)
+    }
+
+    /// 停止イベント連動のデデュープ(停止ID 単位)。ttl 以内の再発火なら false
+    pub fn claim_stop(&self, id: &str, ttl: Duration) -> bool {
+        claim(&self.stop_claims, id, ttl)
+    }
+
     /// 管理対象コンテナの一覧を取得
     pub async fn list_managed(&self) -> Result<Vec<ManagedContainer>> {
         let containers = self
@@ -263,6 +297,19 @@ impl DockerClient {
             }
         }
         Ok(managed)
+    }
+
+    /// compose コンテナの依存参照グラフを取得する(管理外コンテナも含む)
+    /// dormant.enable の有無で絞らない。ラベルは一覧応答から直接読む(individual inspect 不要)
+    pub async fn list_dependency_refs(&self) -> Result<Vec<DependencyRef>> {
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await?;
+        Ok(containers.iter().filter_map(parse_dependency_ref).collect())
     }
 
     /// コンテナのIPアドレスを取得
@@ -372,6 +419,69 @@ impl DockerClient {
                     let action = event.action.as_deref().unwrap_or("");
                     tracing::debug!("docker event: type={} action={}", t, action);
 
+                    // 起動/停止イベント連動。dormant.enable 不要。管理外(awaken 等)でもトリガーになれる
+                    if t == "container" {
+                        match action {
+                            "start" => {
+                                let labels = event
+                                    .actor
+                                    .as_ref()
+                                    .and_then(|a| a.attributes.as_ref());
+                                for group in labels.map(parse_trigger_groups).unwrap_or_default() {
+                                    if !self.claim_trigger(&group, TRIGGER_DEDUPE_TTL) {
+                                        continue;
+                                    }
+                                    let docker = self.clone();
+                                    let router = router.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            trigger_group_start(&docker, &router, &group).await
+                                        {
+                                            tracing::warn!(
+                                                "trigger-group '{}' start failed: {}",
+                                                group,
+                                                e
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+                            "die" | "stop" => {
+                                // depends_on を持たないコンテナの停止では連鎖停止の対象が無い。
+                                // 全コンテナ一覧の取得(list_dependency_refs)を省いてイベント処理を軽くする
+                                let has_deps = event
+                                    .actor
+                                    .as_ref()
+                                    .and_then(|a| a.attributes.as_ref())
+                                    .and_then(|attrs| attrs.get(LABEL_COMPOSE_DEPENDS_ON))
+                                    .map(|v| !v.trim().is_empty())
+                                    .unwrap_or(false);
+                                if has_deps {
+                                    let id = event.actor.as_ref().and_then(|a| a.id.clone());
+                                    if let Some(id) = id {
+                                        if self.claim_stop(&id, TRIGGER_DEDUPE_TTL) {
+                                            let docker = self.clone();
+                                            let router = router.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = stop_orphan_dependents(
+                                                    &docker, &router, &id,
+                                                )
+                                                .await
+                                                {
+                                                    tracing::warn!(
+                                                        "stop orphan dependents failed: {}",
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
                     if matches!(
                         action,
                         "create" | "start" | "stop" | "destroy" | "die" | "rename"
@@ -395,6 +505,18 @@ impl DockerClient {
             }
         }
     }
+}
+
+/// デデュープの実体。ttl 以内の再発火なら false、発火済みでなければ記録して true
+fn claim(map: &Mutex<HashMap<String, Instant>>, key: &str, ttl: Duration) -> bool {
+    let mut claims = map.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    claims.retain(|_, t| now.duration_since(*t) < ttl);
+    if claims.contains_key(key) {
+        return false;
+    }
+    claims.insert(key.to_string(), now);
+    true
 }
 
 /// コンテナ一覧からルーターを再構築
@@ -633,22 +755,7 @@ fn parse_container(c: &ContainerSummary) -> Option<ManagedContainer> {
         .unwrap_or_default();
 
     // depends_on: `サービス名:コンディション:必須フラグ` のカンマ区切り
-    let depends_on = labels
-        .get(LABEL_COMPOSE_DEPENDS_ON)
-        .map(|v| {
-            v.split(',')
-                .filter_map(|s| {
-                    let mut parts = s.trim().splitn(3, ':');
-                    let service = parts.next()?.to_string();
-                    if service.is_empty() {
-                        return None;
-                    }
-                    let condition = parts.next().unwrap_or("service_started").to_string();
-                    Some(Dependency { service, condition })
-                })
-                .collect::<Vec<Dependency>>()
-        })
-        .unwrap_or_default();
+    let depends_on = parse_depends_on(labels.get(LABEL_COMPOSE_DEPENDS_ON).map(|s| s.as_str()));
 
     // dormant.tcp ラベル: `PORT` / `LISTEN_PORT:CONTAINER_PORT` のカンマ区切り(複数可)
     let tcp_expose = labels
@@ -718,6 +825,38 @@ impl ManagedContainer {
     }
 }
 
+/// compose depends_on ラベルをパースする
+/// 形式: `サービス名:コンディション:必須フラグ` のカンマ区切り
+fn parse_depends_on(v: Option<&str>) -> Vec<Dependency> {
+    v.map(|v| {
+        v.split(',')
+            .filter_map(|s| {
+                let mut parts = s.trim().splitn(3, ':');
+                let service = parts.next()?.to_string();
+                if service.is_empty() {
+                    return None;
+                }
+                let condition = parts.next().unwrap_or("service_started").to_string();
+                Some(Dependency { service, condition })
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// コンテナ一覧の1要素から依存参照ノードを作る(compose コンテナのみ対象)
+fn parse_dependency_ref(c: &ContainerSummary) -> Option<DependencyRef> {
+    let labels = c.labels.as_ref()?;
+    Some(DependencyRef {
+        id: c.id.clone()?,
+        running: c.state == Some(ContainerSummaryStateEnum::RUNNING),
+        compose_project: labels.get(LABEL_COMPOSE_PROJECT).cloned(),
+        compose_service: labels.get(LABEL_COMPOSE_SERVICE).cloned(),
+        depends_on: parse_depends_on(labels.get(LABEL_COMPOSE_DEPENDS_ON).map(|s| s.as_str())),
+        managed: labels.get(LABEL_ENABLE).map(|v| v == "true").unwrap_or(false),
+    })
+}
+
 /// "1h" / "30m" / "90s" 形式の時間をパース
 fn parse_duration(v: Option<&str>, default: &str) -> Duration {
     v.and_then(|s| humantime::parse_duration(s).ok())
@@ -736,6 +875,20 @@ fn parse_aliases(v: &str) -> Vec<String> {
     v.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// dormant.trigger-group ラベルをパースする
+/// 形式: `group` のカンマ区切り(trim・空除去・重複除去・順序保持)
+pub(crate) fn parse_trigger_groups(labels: &HashMap<String, String>) -> Vec<String> {
+    let Some(v) = labels.get(LABEL_TRIGGER_GROUP) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && seen.insert(s.to_string()))
+        .map(str::to_string)
         .collect()
 }
 
@@ -1042,6 +1195,33 @@ mod tests {
         };
         let m = parse_container(&c).unwrap();
         assert!(!m.always_on, "true 以外は false");
+    }
+
+    #[test]
+    fn test_parse_trigger_groups() {
+        let mut labels = HashMap::new();
+        assert_eq!(parse_trigger_groups(&labels), Vec::<String>::new());
+        labels.insert(LABEL_TRIGGER_GROUP.to_string(), "ftpsync-helper".to_string());
+        assert_eq!(parse_trigger_groups(&labels), vec!["ftpsync-helper"]);
+        labels.insert(
+            LABEL_TRIGGER_GROUP.to_string(),
+            " g1 , ,g2,g1, ".to_string(),
+        );
+        assert_eq!(parse_trigger_groups(&labels), vec!["g1", "g2"]);
+        labels.insert(LABEL_TRIGGER_GROUP.to_string(), "  ,  ".to_string());
+        assert_eq!(parse_trigger_groups(&labels), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn test_claim_trigger_ttl() -> Result<()> {
+        let (docker, _mock) = crate::testutil::setup_mock_docker(Vec::new()).await;
+        let ttl = Duration::from_millis(50);
+        assert!(docker.claim_trigger("g", ttl));
+        assert!(!docker.claim_trigger("g", ttl), "TTL 内の再発火は false");
+        assert!(docker.claim_trigger("other", ttl), "別キーは独立");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(docker.claim_trigger("g", ttl), "TTL 経過後は再発火可");
+        Ok(())
     }
 
     #[test]

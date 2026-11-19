@@ -1,5 +1,7 @@
 //! 設定とDockerラベル定数
 
+use std::time::Duration;
+
 use crate::Args;
 
 /// ラベルキー
@@ -18,6 +20,9 @@ pub const LABEL_ALIAS: &str = "dormant.alias";
 pub const LABEL_TCP: &str = "dormant.tcp";
 /// 常時ONラベル。`true` でアイドル停止・補助コンテナ回収の対象外にする
 pub const LABEL_ALWAYS_ON: &str = "dormant.always-on";
+/// 起動イベント連動ラベル。このコンテナが起動したら、カンマ区切りのグループを連動起動する
+/// (`dormant.enable` は不要。dormant 管理外のコンテナでもトリガーになれる)
+pub const LABEL_TRIGGER_GROUP: &str = "dormant.trigger-group";
 
 /// compose が付与するラベル
 pub const LABEL_COMPOSE_DEPENDS_ON: &str = "com.docker.compose.depends_on";
@@ -26,6 +31,9 @@ pub const LABEL_COMPOSE_SERVICE: &str = "com.docker.compose.service";
 
 /// 依存解決の深さ制限(循環参照対策)
 pub const MAX_DEPENDENCY_DEPTH: usize = 10;
+
+/// イベント連動のデデュープ TTL(起動連動はグループ単位、停止連動は停止ID単位)
+pub const TRIGGER_DEDUPE_TTL: Duration = Duration::from_secs(5);
 
 /// デフォルト値
 pub const DEFAULT_SESSION_DURATION: &str = "1h";

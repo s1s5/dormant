@@ -39,6 +39,10 @@ pub struct MockContainer {
     pub networks: Vec<(String, String)>,
     /// ネットワークごとのエイリアス (ネットワーク名, エイリアス一覧)
     pub aliases: Vec<(String, Vec<String>)>,
+    /// dormant 管理対象か(dormant.enable=true を出すか)
+    pub managed: bool,
+    /// 追加ラベル(compose ラベルなど)
+    pub labels: Vec<(String, String)>,
 }
 
 impl MockContainer {
@@ -53,6 +57,8 @@ impl MockContainer {
             health: None,
             networks: Vec::new(),
             aliases: Vec::new(),
+            managed: true,
+            labels: Vec::new(),
         }
     }
 }
@@ -381,10 +387,24 @@ async fn handle(
         let arr = containers
             .iter()
             .map(|c| {
-                format!(
-                    "{{\"Id\":\"{}\",\"Names\":[\"/{}-1\"],\"Ports\":[{{\"PrivatePort\":{}}}],\"Labels\":{{\"dormant.enable\":\"true\",\"dormant.port\":\"{}\"}},\"State\":\"{}\"}}",
-                    c.id, c.id, c.port, c.port, if c.running { "running" } else { "exited" }
-                )
+                let mut labels = std::collections::HashMap::from([(
+                    "dormant.port".to_string(),
+                    c.port.to_string(),
+                )]);
+                if c.managed {
+                    labels.insert("dormant.enable".to_string(), "true".to_string());
+                }
+                for (k, v) in &c.labels {
+                    labels.insert(k.clone(), v.clone());
+                }
+                serde_json::json!({
+                    "Id": c.id,
+                    "Names": [format!("/{}-1", c.id)],
+                    "Ports": [{"PrivatePort": c.port, "Type": "tcp"}],
+                    "Labels": labels,
+                    "State": if c.running { "running" } else { "exited" },
+                })
+                .to_string()
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -643,4 +663,25 @@ pub fn make_compose_container(
     c.compose_service = Some(service.to_string());
     c.depends_on = depends_on;
     c
+}
+
+/// compose ラベル一式を生成(depends_on は「サービス:コンディション:必須」形式、空なら付けない)
+pub fn compose_labels(project: &str, service: &str, depends_on: &str) -> Vec<(String, String)> {
+    let mut v = vec![
+        (
+            "com.docker.compose.project".to_string(),
+            project.to_string(),
+        ),
+        (
+            "com.docker.compose.service".to_string(),
+            service.to_string(),
+        ),
+    ];
+    if !depends_on.is_empty() {
+        v.push((
+            "com.docker.compose.depends_on".to_string(),
+            depends_on.to_string(),
+        ));
+    }
+    v
 }

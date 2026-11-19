@@ -8,6 +8,7 @@ Docker **scale-to-zero リバースプロキシ**。`dormant.enable=true` ラベ
 - **TCP 転送**：`dormant.tcp` ラベルで公開したポートへ dormant が待ち受け、接続をコンテナへ透過転送。
 - **アイドル停止**：最終アクセスからセッション保持時間（`dormant.session-duration`、既定 1h）を超えると自動停止。
 - **グループ連鎖**：`dormant.group` で複数コンテナをまとめ、依存（`compose.depends_on`）を連鎖的に起動・停止。
+- **起動イベント連動**：`dormant.trigger-group` を付けたコンテナ（awaken 管理など dormant 管理外でも可）が起動すると、指定グループを連動起動。参照元が全て停止したら依存先も停止。
 - **ヘルスチェック**：`dormant.healthcheck.*` で起動待ちを確認してから転送開始。
 - **WebSocket / SSE 対応**：アクティブ接続中のコンテナは停止対象外。
 - **HTTP/1.1 ・ HTTP/2 対応**、`/healthz` で自ヘルスチェック。
@@ -170,6 +171,7 @@ docker run -d --name myapp \
 | `dormant.host` | ルーティング用ホスト名。`host[:port]` 形式のカンマ区切りで複数指定可能。ポート省略時は `dormant.port`（または公開ポート）へ振り分け |
 | `dormant.tcp` | TCP転送。`PORT`（listen=コンテナ=同一）または `LISTEN_PORT:CONTAINER_PORT`、カンマ区切りで複数 |
 | `dormant.group` | グループ名。同一グループを連動起動・停止 |
+| `dormant.trigger-group` | このコンテナが起動したら、カンマ区切りで指定したグループを連動起動する（`dormant.enable` は不要） |
 | `dormant.session-duration` | セッション保持時間（例 `30m`, `2h`。既定 `1h`） |
 | `dormant.startup.timeout` | 起動タイムアウト（既定 `3m`） |
 | `dormant.healthcheck.path` | 起動待ちヘルスチェックのパス |
@@ -219,6 +221,64 @@ docker run -d --name myapp \
 ### 依存関係（compose）
 
 `compose.depends_on` を使うと、`docker compose` の依存先コンテナを管理対象として一緒に起動します。依存先のポート未指定コンテナは、起動して IP だけ返します。
+
+#### 起動イベント連動（`dormant.trigger-group`）
+
+`dormant.trigger-group=<group>` を付けたコンテナが **起動（start）したとき**、指定グループの管理対象コンテナを連動起動します。
+
+- トリガー側に `dormant.enable` は不要です。awaken など dormant 管理外のコンテナでもトリガーになれます
+- `docker start` でも `docker compose up` でも、start イベントが発生すれば発火します（`depends_on` と違い、個別 start でも効きます）
+- グループ側は `dormant.enable=true` と `dormant.group=<group>` を付けます
+- カンマ区切りで複数グループを指定できます（前後空白はトリム、空要素・重複は無視）
+- 指定グループに管理対象メンバーがいなければ `warn` ログを出して何もしません
+- 同じグループの連動起動は 5 秒間デデュープされます（グループ起動に伴う start イベントで再帰的に発火しません）
+
+```yaml
+  worker:
+    labels:
+      awaken.enable: "true"
+      dormant.trigger-group: "ftpsync-helper"   # worker 起動 → helper グループを起動
+
+  helper:
+    labels:
+      dormant.enable: "true"
+      dormant.group: "ftpsync-helper"           # dormant.port 無し = running で ready
+```
+
+注意点:
+
+- **dormant の常駐が前提**です。dormant が停止している間に起動したコンテナの start イベントは拾えません
+- `restart: always` のコンテナは起動のたびにグループを起こします（意図した挙動）
+- イベントの `Actor.Attributes` にラベルが入らない実装（一部の podman 互換環境など）では発火しません
+
+#### 停止イベント連動
+
+コンテナ T が停止（`die` / `stop`）すると、T の `compose.depends_on` の依存先のうち、**dormant 管理下で running かつ、他に running な参照元が無い**ものを停止します。停止した依存先があれば再帰的に判定します。
+
+- 参照元は「`compose.depends_on` を持つコンテナ」を広く数えます。dormant 管理外（awaken 管理など）のコンテナも参照元として扱います
+- 参照元が1つでも running なら依存先は停止しません（例: A と B が X を参照しているとき、A が寝ても B が生きていれば X は残る）
+- dormant 管理外のコンテナ自体は起動も停止もしません（その依存先の判定だけを行います）
+- 同一 compose プロジェクト内の依存解決のみ対象です（`com.docker.compose.project` が一致するコンテナ同士）
+- `dormant.always-on=true` のコンテナは停止しません
+- アイドル停止（既存の `stop_chain`）も同じ参照グラフを使います。参照グラフが取得できない場合は従来の静的な依存判定にフォールバックします
+
+```yaml
+  app:                      # A: dormant 管理（HTTP）
+    labels:
+      dormant.enable: "true"
+    depends_on: [helper]    # A 停止 → helper の停止判定
+
+  worker:                   # B: awaken 管理（dormant.enable なし）
+    labels:
+      awaken.enable: "true"
+      dormant.trigger-group: "ftpsync-helper"
+    depends_on: [helper]    # 参照元として数える（停止連動に必要）
+
+  helper:                   # X: dormant 管理・ポート無し
+    labels:
+      dormant.enable: "true"
+      dormant.group: "ftpsync-helper"
+```
 
 #### 補助コンテナの自動回収
 
